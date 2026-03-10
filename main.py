@@ -4,6 +4,7 @@ import json
 import time
 from huggingface_hub import hf_hub_download
 from ultralytics import YOLO
+import pika
 from plate_utils import extract_best_plate_read, should_send_plate
 
 # ==========================================
