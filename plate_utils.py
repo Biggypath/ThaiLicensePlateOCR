@@ -1,72 +1,23 @@
 """
-plate_utils.py — Thai licence-plate helper utilities  (v9 — MAX ACCURACY)
+plate_utils.py — Thai licence-plate helper utilities  (v10.1 — LLM FALLBACK + LEADING-DIGIT FIX)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-KEY CHANGES vs v8
+KEY CHANGES vs v10
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-PREPROCESSING (highest impact):
-  [CV-6]  MULTI-STRATEGY BINARIZATION — three strategies run in parallel:
-            A) Adaptive Gaussian with LARGER 31px kernel (was 11px)
-               Critical fix: 11px kernel destroys Thai consonant strokes
-            B) Otsu on CLAHE-equalised gray — works well with good contrast
-            C) Adaptive Mean with 25px kernel — gentler on thin strokes
-          Best strategy selected by connected-component plausibility score
-          targeting 6–8 large blobs (2 consonants + 4 digits + diacritics).
+  [FIX-1] PL-4 LEADING-DIGIT CONSONANT BUG — previously the consonant
+          candidate for "3กบ7744" was stored as "กบ" (losing the "3"),
+          so PL-4 reconstructed "กบ7744" instead of the correct "3กบ7744".
+          Fix: _CONS_PREFIX_RE now matches the optional leading digit AND
+          the two consonants together, so "3กบ" is stored as-is and
+          merge_digit_evidence("7744", ["3กบ"]) produces "3กบ7744".
 
-  [CV-7]  LARGER MORPHOLOGICAL CLOSING — 3×3 kernel (was 2×2).
-          Thai consonants like ฐ and บ have many thin joining strokes;
-          a 2×2 closing kernel cannot bridge gaps caused by binarization.
-          3×3 reliably reconnects broken strokes.
+  [FIX-2] PlateMajorityVoter.update() now also adds the full valid plate
+          text to _consonant_candidates when is_valid_plate() passes, so
+          even before the Tier-1 window fills, the leading-digit form is
+          preserved for Tier-2 fallback.
 
-  [CV-8]  TIGHTER NUMBER-ZONE CROP — cuts province strip more aggressively.
-          Top 10%–72% of height (was 15%–80%). Province text at bottom
-          bleeds into the number zone and produces garbage OCR tokens.
-
-  [CV-9]  SMART PROVINCE-LINE DETECTION — scans row means in the bottom
-          40% of the crop to locate the province strip boundary and cuts
-          precisely above it, adapting to variable plate aspect ratios.
-
-OCR (new parallel path):
-  [OCR-5] RAW-COLOR PARALLEL OCR — EasyOCR is run on the raw BGR crop
-          (no binarization) at a normalised 80px height in addition to
-          the preprocessed path. Thai plates have natural high contrast;
-          the raw image often preserves consonant detail that binarization
-          destroys. Both paths are fused before correction.
-
-  [OCR-6] BEAMSEARCH DECODER for raw path — beamWidth=10 captures more
-          Thai consonant hypotheses at low confidence.
-
-  [OCR-7] MIN_CONFIDENCE floor lowered to 0.05 for raw path results;
-          the corrector and voter gates downstream handle quality.
-
-Voter:
-  [PL-4]  PARTIAL-EVIDENCE ACCUMULATION in PlateMajorityVoter.
-          Even when correct_plate() returns None (consonants destroyed),
-          the voter now accumulates:
-            - digit_suffix_counter: 4-digit tails seen per frame
-            - consonant_candidates: any consonant pairs seen at conf > 0.15
-          After MIN_DIGIT_VOTES frames with the same digit suffix, the
-          voter attempts reconstruction via merge_digit_evidence().
-          This recovers plates like ฐบ3699 from runs of "3699" + "ฐบ..." .
-
-Corrections carried forward from v8:
-  [PP-1]  Domain-enforced format correction (plate_corrector.py 5-pass).
-  [PP-2]  Correction-score confidence penalty.
-  [PP-3]  Valid-plate gating on voter output.
-  [OCR-1] Dual-engine fusion with agreement boost.
-  [OCR-2] Adaptive confidence threshold (YOLO conf → OCR threshold).
-  [CV-1]  Multi-scale preprocessing (sharpest scale wins).
-  [CV-2]  Morphological cleanup (now upgraded to [CV-7]).
-  [CV-3]  Contrast-aware polarity inversion.
-  [CV-4]  LAB-CLAHE illumination normalisation.
-  [CV-5]  Sub-degree affine deskew via Hough median angle.
-  [PL-1]  IoU-based per-track voter.
-  [PL-2]  Weighted majority vote (YOLO × OCR × correction penalty).
-  [PL-3]  Stability gate with exit-hysteresis.
-  [PF-1]  Skip OCR when box barely moved.
-  [PF-2]  Tesseract at 2× scale.
-  [PF-3]  Province detection cached per track.
+All v10 improvements retained unchanged — see v10 header for full list.
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
@@ -91,6 +42,7 @@ from plate_corrector import (
     extract_digit_suffix,
     merge_digit_evidence,
     THAI_CONSONANTS as _CORRECTOR_CONSONANTS,
+    normalise_raw as _normalise_raw,
 )
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -111,6 +63,12 @@ TESSERACT_PROV_CONFIG = (
     "--oem 1 --psm 7 "
     "-c tessedit_char_whitelist="
     + THAI_CONSONANTS + THAI_VOWELS + " "
+)
+
+# [FIX-1] Regex that captures optional leading digit + exactly 2 consonants
+# Used in PlateMajorityVoter to store consonant candidates with leading digit
+_CONS_PREFIX_RE = re.compile(
+    r'^([0-9]?)([' + _CORRECTOR_CONSONANTS + r']{2})'
 )
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -226,11 +184,57 @@ def _char_jaccard(a: str, b: str) -> float:
     return inter / union if union else 0.0
 
 
+def _ngram_score(a: str, b: str, n: int = 2) -> float:
+    """Character n-gram overlap — more robust than Jaccard for garbled OCR."""
+    def ngrams(s: str) -> Counter:
+        return Counter(s[i:i+n] for i in range(len(s) - n + 1))
+    ca, cb = ngrams(a), ngrams(b)
+    inter  = sum((ca & cb).values())
+    union  = sum((ca | cb).values())
+    return inter / union if union else 0.0
+
+
+def _prefix_score(raw: str, province: str) -> float:
+    """
+    [PROV-6] Give credit when the OCR output is a prefix of the province name.
+    E.g. "กรงเทพ" should strongly match "กรุงเทพมหานคร" even though the full
+    Jaccard is diluted by the many characters in the long province name.
+    Returns fraction of raw consonants that appear at the START of province
+    consonants (in order), capped at 0.85 since it's not a full match.
+    """
+    rc = _consonants_only(raw)
+    pc = _consonants_only(province)
+    if not rc or not pc:
+        return 0.0
+    # How many leading consonants of pc match rc?
+    min_len = min(len(rc), len(pc))
+    matches = sum(1 for i in range(min_len) if rc[i] == pc[i])
+    if matches < 2:
+        return 0.0
+    # Score = matching prefix length / raw consonant length
+    return min(0.85, matches / len(rc))
+
+
 def normalize_province(raw: str) -> Optional[dict]:
+    """
+    [PROV-1, PROV-6] Multi-metric fuzzy matcher.
+    Scores each province with four metrics and takes the maximum:
+      1. Full-string character Jaccard
+      2. Consonants-only Jaccard  (vowels often garbled)
+      3. Bigram overlap on consonants  (handles character transpositions)
+      4. Prefix match on consonants  (handles truncated OCR reads)
+    Threshold lowered to 0.20 since OCR of the small province strip is
+    frequently garbled. Province cache is keyed per-track so the expensive
+    multi-strategy OCR only runs once per vehicle.
+    """
     if not raw:
         return None
     raw_clean = raw.strip()
     raw_cons  = _consonants_only(raw_clean)
+
+    # Guard: need at least 2 characters to avoid single-char false positives
+    if len(raw_clean) < 2:
+        return None
 
     if raw_clean in PROVINCE_MAP:
         info = PROVINCE_MAP[raw_clean]
@@ -239,14 +243,18 @@ def normalize_province(raw: str) -> Optional[dict]:
 
     best_score, best_province = 0.0, None
     for pname in _ALL_PROVINCE_NAMES:
+        pcons = _PROVINCE_CONSONANTS[pname]
         score = max(
             _char_jaccard(raw_clean, pname),
-            _char_jaccard(raw_cons, _PROVINCE_CONSONANTS[pname]),
+            _char_jaccard(raw_cons, pcons),
+            _ngram_score(raw_cons, pcons, n=2) if len(raw_cons) >= 2 else 0.0,
+            _prefix_score(raw_clean, pname),             # [PROV-6]
         )
         if score > best_score:
             best_score, best_province = score, pname
 
-    if best_province and best_score >= 0.30:
+    # [PROV-1] Lowered from 0.30 → 0.20
+    if best_province and best_score >= 0.20:
         info = PROVINCE_MAP[best_province]
         return {
             "thai":   best_province,
@@ -261,61 +269,158 @@ def normalize_province(raw: str) -> Optional[dict]:
 # PROVINCE STRIP EXTRACTION
 # ═══════════════════════════════════════════════════════════════════════════
 
+# [PROV-2] Wider set of strip candidates — province text sits in the bottom
+# ~25 % of the plate crop at this camera angle.
 _STRIP_CANDIDATES = [
     (0.72, 1.00, "bottom"),
-    (0.00, 0.22, "top"),
     (0.68, 1.00, "bottom_wide"),
+    (0.75, 1.00, "bottom_tight"),
+    (0.00, 0.22, "top"),
+    (0.00, 0.28, "top_wide"),
 ]
 
-
-def _preprocess_province_strip(strip_bgr: np.ndarray) -> np.ndarray:
-    h, w  = strip_bgr.shape[:2]
-    scale = max(1, int(np.ceil(80 / max(h, 1))))
-    up    = cv2.resize(strip_bgr, (w * scale, h * scale),
-                       interpolation=cv2.INTER_CUBIC)
-    gray  = cv2.cvtColor(up, cv2.COLOR_BGR2GRAY)
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
-    gray  = clahe.apply(gray)
-    return cv2.adaptiveThreshold(
-        gray, 255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY, 15, 8,
-    )
+# Tesseract PSM modes to try for province text  [PROV-3]
+_PROV_PSM_MODES = [7, 6, 8]   # single-line, block-of-text, single-word
 
 
-def _ocr_strip_tesseract(binary: np.ndarray) -> str:
+def _upscale_strip(strip_bgr: np.ndarray, target_h: int = 48) -> np.ndarray:
+    """Upscale strip so province glyphs are at least target_h pixels tall."""
+    h, w = strip_bgr.shape[:2]
+    if h < 4:
+        return strip_bgr
+    scale = max(1.0, target_h / h)
+    new_w = max(1, int(w * scale))
+    new_h = max(1, int(h * scale))
+    return cv2.resize(strip_bgr, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
+
+
+def _preprocess_province_strip_multi(strip_bgr: np.ndarray) -> list[np.ndarray]:
+    """
+    [PROV-4] Return MULTIPLE binarizations of the province strip so Tesseract
+    gets several chances.  The original single-strategy approach destroyed
+    small province text; here we try four strategies and return all of them.
+    """
+    up   = _upscale_strip(strip_bgr, target_h=60)
+    gray = cv2.cvtColor(up, cv2.COLOR_BGR2GRAY)
+
+    # Strategy A — CLAHE + gentle adaptive threshold (large block size)
+    clahe  = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
+    eq     = clahe.apply(gray)
+    thr_a  = cv2.adaptiveThreshold(
+        eq, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 10)
+
+    # Strategy B — same with smaller block (finer detail)
+    thr_b  = cv2.adaptiveThreshold(
+        eq, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 15, 6)
+
+    # Strategy C — Otsu on CLAHE-equalised gray (global threshold)
+    _, thr_c = cv2.threshold(eq, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # Strategy D — raw gray Otsu (no CLAHE) — sometimes cleaner on white plates
+    _, thr_d = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    results = []
+    for thr in (thr_a, thr_b, thr_c, thr_d):
+        # Invert if background is white (Tesseract prefers dark text on white)
+        img = thr if np.mean(thr) < 127 else cv2.bitwise_not(thr)
+        results.append(img)
+    return results
+
+
+def _ocr_strip_tesseract_multi(strip_bgr: np.ndarray) -> str:
+    """
+    [PROV-3, PROV-4] Run Tesseract with multiple PSM modes AND multiple
+    binarizations.  Return the longest non-empty result (most characters
+    recovered = most useful for fuzzy matching).
+    """
     if not _TESSERACT_AVAILABLE:
         return ""
-    try:
-        return pytesseract.image_to_string(
-            PILImage.fromarray(binary), lang="tha",
-            config=TESSERACT_PROV_CONFIG,
-        ).strip()
-    except Exception as exc:
-        print(f"  [Province Tesseract error] {exc}")
+
+    candidates: list[str] = []
+    binaries = _preprocess_province_strip_multi(strip_bgr)
+
+    for psm in _PROV_PSM_MODES:
+        config = (
+            f"--oem 1 --psm {psm} "
+            f"-c tessedit_char_whitelist={THAI_CONSONANTS + THAI_VOWELS + ' '}"
+        )
+        for binary in binaries:
+            try:
+                text = pytesseract.image_to_string(
+                    PILImage.fromarray(binary), lang="tha", config=config,
+                ).strip()
+                if text:
+                    candidates.append(text)
+            except Exception:
+                pass
+
+    if not candidates:
         return ""
+    # Return longest result — more characters = better fuzzy match signal
+    return max(candidates, key=len)
 
 
-def _ocr_strip_easyocr(reader, strip_bgr: np.ndarray) -> str:
-    try:
-        results = reader.readtext(
-            strip_bgr, detail=1, paragraph=False,
-            allowlist=THAI_CONSONANTS + THAI_VOWELS + " ",
-        )
-        return " ".join(
-            r[1] for r in sorted(results, key=lambda r: r[0][0][0])
-            if r[2] > 0.05
-        )
-    except Exception as exc:
-        print(f"  [Province EasyOCR error] {exc}")
-        return ""
+def _ocr_strip_easyocr(reader, strip_bgr: np.ndarray) -> list[str]:
+    """
+    [PROV-5] Return MULTIPLE EasyOCR reads at different scales so the
+    caller can try all of them against the fuzzy matcher.
+    Runs on: original strip, ×2 upscale, ×3 upscale.
+    """
+    results_out: list[str] = []
+
+    for scale in (1, 2, 3):
+        if scale == 1:
+            img = strip_bgr
+        else:
+            h, w = strip_bgr.shape[:2]
+            img  = cv2.resize(strip_bgr, (w * scale, h * scale),
+                              interpolation=cv2.INTER_CUBIC)
+        try:
+            hits = reader.readtext(
+                img, detail=1, paragraph=False,
+                allowlist=THAI_CONSONANTS + THAI_VOWELS + " ",
+            )
+            text = " ".join(
+                r[1] for r in sorted(hits, key=lambda r: r[0][0][0])
+                if r[2] > 0.03           # [PROV-5] lower conf floor
+            )
+            if text:
+                results_out.append(text)
+        except Exception as exc:
+            print(f"  [Province EasyOCR scale={scale} error] {exc}")
+
+    return results_out
+
+
+def _try_match(raw: str, best_score: float, best_result, label: str, engine: str):
+    """Helper: run normalize_province and return updated (best_score, best_result)."""
+    if not raw:
+        return best_score, best_result
+    match = normalize_province(raw)
+    if match and match["score"] > best_score:
+        print(f"  [Province strip={label}] {engine} '{raw[:30]}' "
+              f"→ {match['thai']} ({match['score']:.2f})")
+        return match["score"], {**match, "strip": label}
+    return best_score, best_result
 
 
 def extract_province_from_crop(
     bgr_crop: np.ndarray,
     easyocr_reader=None,
 ) -> Optional[dict]:
-    """[PF-3] Probe multiple strips; stop early on high confidence."""
+    """
+    [PROV-2…5] Multi-strategy province extractor.
+
+    Improvements vs previous version:
+      [PROV-2] More strip y-positions tried
+      [PROV-3] Tesseract tested with PSM 6, 7, 8
+      [PROV-4] Four binarization strategies per strip (not one)
+      [PROV-5] EasyOCR run at three zoom levels; conf floor 0.03
+      [PROV-1] Fuzzy threshold lowered (handled in normalize_province)
+
+    Early-exit at score ≥ 0.75 (was 0.85) since province text on
+    ESP32-CAM crops rarely produces a perfect match.
+    """
     if bgr_crop is None or bgr_crop.size == 0:
         return None
     h, w = bgr_crop.shape[:2]
@@ -330,34 +435,83 @@ def extract_province_from_crop(
             continue
         strip = bgr_crop[y0:y1, :]
 
+        # ── EasyOCR (color, multi-scale) ──────────────────────────────────
         if easyocr_reader is not None:
-            raw = _ocr_strip_easyocr(easyocr_reader, strip)
-            if raw:
-                match = normalize_province(raw)
-                if match and match["score"] > best_score:
-                    best_score  = match["score"]
-                    best_result = {**match, "strip": label}
-                    print(f"  [Province strip={label}] EasyOCR '{raw}' "
-                          f"→ {match['thai']} ({match['score']:.2f})")
+            for raw in _ocr_strip_easyocr(easyocr_reader, strip):
+                best_score, best_result = _try_match(
+                    raw, best_score, best_result, label, "EasyOCR")
+                if best_score >= 0.75:
+                    return best_result
 
-        binary = _preprocess_province_strip(strip)
-        raw    = _ocr_strip_tesseract(binary)
-        if raw:
-            match = normalize_province(raw)
-            if match and match["score"] > best_score:
-                best_score  = match["score"]
-                best_result = {**match, "strip": label}
-                print(f"  [Province strip={label}] Tesseract '{raw}' "
-                      f"→ {match['thai']} ({match['score']:.2f})")
+        # ── Tesseract (multi-PSM, multi-binarization) ─────────────────────
+        raw = _ocr_strip_tesseract_multi(strip)
+        best_score, best_result = _try_match(
+            raw, best_score, best_result, label, "Tesseract")
 
-        if best_score >= 0.85:
-            break
+        if best_score >= 0.75:
+            return best_result
+
+    return best_result
+
+
+
+def extract_province_from_ocr_tokens(
+    ocr_results: list,
+    min_len: int = 4,
+) -> Optional[dict]:
+    """
+    [PROV-7] Mine province text from OCR tokens already collected during the
+    number-zone scan.  EasyOCR on the raw color crop frequently picks up the
+    province line as a second text region (e.g. 'กรทพมหวบกร' alongside the
+    plate number).  This is free — no extra OCR call needed.
+
+    Logic:
+      • Any token that contains NO Arabic digits AND has >= min_len Thai chars
+        is a candidate province string.
+      • Run each through normalize_province() and keep the best match.
+
+    Called in main.py immediately after the number-zone OCR step, before the
+    per-track province strip scan (which is now a fallback only).
+
+    Parameters
+    ----------
+    ocr_results : flat list of (bbox, text, conf) tuples from EasyOCR / Tesseract
+    min_len     : minimum character length to bother matching (default 4)
+
+    Returns best-matching province dict or None.
+    """
+    best_result, best_score = None, 0.0
+
+    for item in ocr_results:
+        if len(item) < 3:
+            continue
+        text, conf = str(item[1]).strip(), float(item[2])
+
+        # Skip tokens that are the plate number itself (contain digits)
+        if any(ch.isdigit() for ch in text):
+            continue
+
+        # Skip very short tokens and low-confidence garbage
+        if len(text) < min_len or conf < 0.03:
+            continue
+
+        # Skip if token is mostly Latin (not Thai)
+        thai_chars = sum(1 for ch in text if '\u0E00' <= ch <= '\u0E7F')
+        if thai_chars < min_len:
+            continue
+
+        match = normalize_province(text)
+        if match and match["score"] > best_score:
+            best_score  = match["score"]
+            best_result = {**match, "strip": "ocr_token", "ocr_conf": conf}
+            print(f"  [Province ocr_token] '{text}' conf={conf:.2f} "
+                  f"\u2192 {match['thai']} ({match['score']:.2f})")
 
     return best_result
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# LEGACY SUBSTITUTION HELPERS  (kept for province strip OCR only)
+# LEGACY SUBSTITUTION HELPERS  (province strip only)
 # ═══════════════════════════════════════════════════════════════════════════
 
 _LATIN_TO_THAI = [
@@ -366,11 +520,7 @@ _LATIN_TO_THAI = [
     ("a",  "า"), ("s",  "ส"), ("w",  "ว"),   ("h",  "ห"), ("o",  "อ"),
     ("x",  "ข"), ("y",  "ย"),
 ]
-_THAI_CORRECTIONS = {
-    "รร": "ร",
-    "าา": "า",
-    "นน": "น",
-}
+_THAI_CORRECTIONS = {"รร": "ร", "าา": "า", "นน": "น"}
 _DIGIT_RE = re.compile(r'\d+')
 
 
@@ -383,7 +533,6 @@ def correct_ocr_substitutions(text: str) -> str:
         last = m.end()
     if last < len(text):
         parts.append((False, text[last:]))
-
     result = []
     for is_digit, segment in parts:
         if is_digit:
@@ -403,8 +552,7 @@ def correct_ocr_substitutions(text: str) -> str:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def normalize_plate_text(text: str) -> str:
-    compact = "".join(text.strip().split()).replace("-", "")
-    return compact.upper()
+    return "".join(text.strip().split()).replace("-", "").upper()
 
 
 def looks_like_thai_plate_top_line(text: str, min_length: int = 3) -> bool:
@@ -441,7 +589,6 @@ def _sharpness_laplacian(gray: np.ndarray) -> float:
 
 
 def _clahe_lab(bgr: np.ndarray) -> np.ndarray:
-    """[CV-4] CLAHE on L channel of LAB colourspace."""
     lab     = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
     clahe   = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
@@ -450,41 +597,26 @@ def _clahe_lab(bgr: np.ndarray) -> np.ndarray:
 
 
 def _score_binarized(img: np.ndarray) -> float:
-    """
-    [CV-6] Score a binarized image by connected-component plausibility.
-    Target: 6–8 large blobs (2 consonants + 4 digits + possible diacritics).
-    Returns a score in [0, 1] — higher is better.
-    """
-    # Ensure dark-on-light polarity for CC analysis
     work = cv2.bitwise_not(img) if np.mean(img) > 127 else img.copy()
     num_labels, _, stats, _ = cv2.connectedComponentsWithStats(work, 8)
     if num_labels <= 1:
         return 0.0
     h_img, w_img = img.shape
     total_area   = h_img * w_img
-    area_min     = total_area * 0.003   # at least 0.3% of image
-    area_max     = total_area * 0.25    # at most 25%
+    area_min     = total_area * 0.003
+    area_max     = total_area * 0.25
     valid = sum(
         1 for i in range(1, num_labels)
         if area_min < stats[i, cv2.CC_STAT_AREA] < area_max
     )
-    # Ideal target: 7 components (ฐ=1, บ=1 or 2, 3=1, 6=1, 9=1, 9=1)
     score = 1.0 - abs(valid - 7) / 10.0
     return max(0.0, score)
 
 
-def _preprocess_at_scale(
-    crop_bgr: np.ndarray,
-    scale: int,
-) -> np.ndarray:
-    """
-    [CV-6] Multi-strategy binarization — three parallel strategies,
-    winner selected by connected-component plausibility score.
-    [CV-7] Larger 3×3 morphological closing kernel for Thai strokes.
-    """
-    h, w = crop_bgr.shape[:2]
-    up   = cv2.resize(crop_bgr, (w * scale, h * scale),
-                      interpolation=cv2.INTER_CUBIC)
+def _preprocess_at_scale(crop_bgr: np.ndarray, scale: int) -> np.ndarray:
+    h, w     = crop_bgr.shape[:2]
+    up       = cv2.resize(crop_bgr, (w * scale, h * scale),
+                          interpolation=cv2.INTER_CUBIC)
     gray     = cv2.cvtColor(up, cv2.COLOR_BGR2GRAY)
     denoised = cv2.bilateralFilter(gray, d=9, sigmaColor=75, sigmaSpace=75)
     clahe    = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
@@ -492,86 +624,43 @@ def _preprocess_at_scale(
     blurred  = cv2.GaussianBlur(eq, (0, 0), sigmaX=3)
     sharp    = cv2.addWeighted(eq, 1.5, blurred, -0.5, 0)
 
-    # [CV-6] Strategy A: large adaptive Gaussian — key fix for Thai consonants
-    # 31px kernel preserves complex stroke topology destroyed by 11px kernel
     thresh_a = cv2.adaptiveThreshold(
-        sharp, 255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY, 31, 8,
-    )
-
-    # [CV-6] Strategy B: Otsu — works well when plate has clean contrast
+        sharp, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 8)
     _, thresh_b = cv2.threshold(
-        sharp, 0, 255,
-        cv2.THRESH_BINARY + cv2.THRESH_OTSU,
-    )
-
-    # [CV-6] Strategy C: adaptive mean — gentler on thin strokes than Gaussian
+        sharp, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     thresh_c = cv2.adaptiveThreshold(
-        sharp, 255,
-        cv2.ADAPTIVE_THRESH_MEAN_C,
-        cv2.THRESH_BINARY, 25, 6,
-    )
+        sharp, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 25, 6)
 
-    # Select strategy with highest CC plausibility score
-    scored = [(
-        _score_binarized(t), t
-    ) for t in (thresh_a, thresh_b, thresh_c)]
+    scored = [(_score_binarized(t), t) for t in (thresh_a, thresh_b, thresh_c)]
     _, thresh = max(scored, key=lambda x: x[0])
 
-    # [CV-3] Contrast-aware polarity inversion
     if np.mean(thresh) > 127:
         thresh = cv2.bitwise_not(thresh)
 
-    # [CV-7] Larger closing kernel: 3×3 reconnects broken Thai strokes
     kern_close = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
     kern_open  = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 1))
     thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kern_close)
     thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN,  kern_open)
-
     return thresh
 
 
 def crop_number_zone(bgr_crop: np.ndarray) -> np.ndarray:
-    """
-    [CV-9] Smart province-line detection.
-    Scans row means in the bottom 40% to find the province strip boundary
-    and cuts precisely above it. Falls back to fixed 10%–72% if detection
-    is ambiguous.
-
-    Thai plate anatomy (approximate):
-      Top border:      ~8–10% of height
-      Number line:     ~10–72% of height
-      Province strip:  ~72–90% of height
-      Bottom border:   ~90–100% of height
-    """
     h, w = bgr_crop.shape[:2]
     if h < 20:
         return bgr_crop
-
-    gray     = cv2.cvtColor(bgr_crop, cv2.COLOR_BGR2GRAY)
-    row_mean = np.mean(gray, axis=1)   # mean brightness per row
-
-    # Province strip is darker than the white number zone
-    # Scan the bottom 40% for a significant brightness drop
-    scan_start = int(h * 0.55)
-    scan_zone  = row_mean[scan_start:]
+    gray         = cv2.cvtColor(bgr_crop, cv2.COLOR_BGR2GRAY)
+    row_mean     = np.mean(gray, axis=1)
+    scan_start   = int(h * 0.55)
+    scan_zone    = row_mean[scan_start:]
     overall_mean = float(np.mean(row_mean))
-
-    # Find first row (from scan_start down) where mean drops below threshold
-    threshold = overall_mean * 0.78
-    drop_rows = np.where(scan_zone < threshold)[0]
-
+    threshold    = overall_mean * 0.78
+    drop_rows    = np.where(scan_zone < threshold)[0]
     if len(drop_rows) > 0:
         province_row = scan_start + int(drop_rows[0])
-        # Add 4px buffer above the province strip
-        cut_bottom = max(int(h * 0.60), min(province_row - 4, int(h * 0.85)))
+        cut_bottom   = max(int(h * 0.60), min(province_row - 4, int(h * 0.85)))
     else:
-        # No clear drop found — use fixed ratio
         cut_bottom = int(h * 0.72)
-
-    cut_top = int(h * 0.10)
-    return bgr_crop[cut_top: cut_bottom, :]
+    return bgr_crop[int(h * 0.10): cut_bottom, :]
 
 
 def preprocess_plate_image(
@@ -579,29 +668,14 @@ def preprocess_plate_image(
     scale: int = 3,
     number_zone_only: bool = True,
 ) -> np.ndarray:
-    """
-    [CV-1] Multi-scale preprocessing: run at two scales, return sharper.
-    [CV-4] LAB-CLAHE illumination normalisation applied first.
-    [CV-8] Tighter crop: uses crop_number_zone() for smart province cutoff.
-    [CV-6] Multi-strategy binarization inside _preprocess_at_scale().
-    """
     if bgr_crop is None or bgr_crop.size == 0:
         raise ValueError("Empty crop passed to preprocess_plate_image")
-
-    bgr_crop = _clahe_lab(bgr_crop)  # [CV-4]
-
-    h, w = bgr_crop.shape[:2]
-    if number_zone_only and h > 30:
-        crop = crop_number_zone(bgr_crop)   # [CV-8, CV-9]
-    else:
-        crop = bgr_crop
-
-    ch, cw = crop.shape[:2]
+    bgr_crop = _clahe_lab(bgr_crop)
+    h, w     = bgr_crop.shape[:2]
+    crop     = crop_number_zone(bgr_crop) if (number_zone_only and h > 30) else bgr_crop
+    ch, cw   = crop.shape[:2]
     if max(ch, cw) >= 200:
-        # Already large — single scale, no upscaling
         return _preprocess_at_scale(crop, 1)
-
-    # [CV-1] Compare two scales; keep the sharper result
     results = []
     for s in (max(1, scale - 1), scale):
         proc      = _preprocess_at_scale(crop, s)
@@ -636,15 +710,14 @@ def _estimate_skew_angle(gray: np.ndarray) -> float:
 
 
 def deskew_plate(bgr_crop: np.ndarray) -> np.ndarray:
-    """[CV-5] Sub-degree affine deskew."""
     if bgr_crop is None or bgr_crop.size == 0:
         return bgr_crop
     gray  = cv2.cvtColor(bgr_crop, cv2.COLOR_BGR2GRAY)
     angle = _estimate_skew_angle(gray)
     if abs(angle) < 0.5:
         return bgr_crop
-    h, w  = bgr_crop.shape[:2]
-    M     = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), angle, 1.0)
+    h, w = bgr_crop.shape[:2]
+    M    = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), angle, 1.0)
     return cv2.warpAffine(bgr_crop, M, (w, h),
                           flags=cv2.INTER_LINEAR,
                           borderMode=cv2.BORDER_REPLICATE)
@@ -655,68 +728,42 @@ def deskew_plate(bgr_crop: np.ndarray) -> np.ndarray:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def run_easyocr(reader, preprocessed_gray: np.ndarray) -> list:
-    """Standard EasyOCR on preprocessed/binarized image."""
     return reader.readtext(
-        preprocessed_gray,
-        detail    = 1,
-        paragraph = False,
-        allowlist = (THAI_ALLOWLIST
-                     + "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"),
+        preprocessed_gray, detail=1, paragraph=False,
+        allowlist=(THAI_ALLOWLIST
+                   + "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"),
     )
 
 
 def run_easyocr_raw(reader, raw_bgr: np.ndarray) -> list:
-    """
-    [OCR-5] EasyOCR on raw BGR crop — no binarization.
-    Thai plates have natural high contrast; the raw image often preserves
-    consonant stroke detail that aggressive binarization destroys.
-    Uses beamsearch decoder for better Thai consonant recall.
-    [OCR-6] beamWidth=10 for wider hypothesis search.
-    """
+    """[OCR-5] EasyOCR on raw BGR crop at normalised 80px height."""
     if raw_bgr is None or raw_bgr.size == 0:
         return []
-
-    # Normalise height to 80px — EasyOCR's sweet spot for Thai characters
     h, w = raw_bgr.shape[:2]
     if h < 30:
         return []
     if h < 60 or h > 110:
-        target_h  = 80
-        new_scale = target_h / max(h, 1)
-        raw_bgr   = cv2.resize(raw_bgr,
-                               (int(w * new_scale), target_h),
+        new_scale = 80 / max(h, 1)
+        raw_bgr   = cv2.resize(raw_bgr, (int(w * new_scale), 80),
                                interpolation=cv2.INTER_CUBIC)
-
-    # Apply light CLAHE to boost contrast before raw OCR
     bgr = _clahe_lab(raw_bgr)
-
     try:
         results = reader.readtext(
-            bgr,
-            detail     = 1,
-            paragraph  = False,
-            allowlist  = (THAI_ALLOWLIST
-                          + "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"),
-            decoder    = "beamsearch",
-            beamWidth  = 10,
+            bgr, detail=1, paragraph=False,
+            allowlist=(THAI_ALLOWLIST
+                       + "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"),
+            decoder="beamsearch", beamWidth=10,
         )
-        # [OCR-7] Lower the confidence floor for raw results — downstream
-        # corrector and voter gate quality; we want to capture weak consonants
-        return [(bbox, text, conf) for bbox, text, conf in results
-                if conf >= 0.05]
+        return [(bbox, text, conf) for bbox, text, conf in results if conf >= 0.05]
     except Exception as exc:
         print(f"  [EasyOCR raw error] {exc}")
-        # Fallback: try without beamsearch (some EasyOCR versions differ)
         try:
             return reader.readtext(
-                bgr,
-                detail    = 1,
-                paragraph = False,
-                allowlist = (THAI_ALLOWLIST
-                             + "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"),
+                bgr, detail=1, paragraph=False,
+                allowlist=(THAI_ALLOWLIST
+                           + "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"),
             )
-        except Exception as exc2:
-            print(f"  [EasyOCR raw fallback error] {exc2}")
+        except Exception:
             return []
 
 
@@ -730,10 +777,9 @@ def run_tesseract(preprocessed_gray: np.ndarray) -> list:
                             interpolation=cv2.INTER_AREA)
                  if max(h, w) > 400 else preprocessed_gray)
         data  = pytesseract.image_to_data(
-            PILImage.fromarray(small),
-            lang        = "tha+eng",
-            config      = TESSERACT_NUM_CONFIG,
-            output_type = pytesseract.Output.DICT,
+            PILImage.fromarray(small), lang="tha+eng",
+            config=TESSERACT_NUM_CONFIG,
+            output_type=pytesseract.Output.DICT,
         )
         sh, sw     = small.shape[:2]
         dummy_bbox = [[0, 0], [sw, 0], [sw, sh], [0, sh]]
@@ -761,14 +807,7 @@ def fuse_ocr_results(
     tess_results: list,
     min_confidence: float = 0.05,
 ) -> list:
-    """
-    [OCR-1] Merge EasyOCR (preprocessed + raw paths) + Tesseract.
-    Agreement between any two sources boosts confidence by +10%.
-    min_confidence lowered to 0.05 to capture weak consonant reads
-    from the raw path; downstream corrector handles quality.
-    """
     combined: dict[str, tuple] = {}
-
     for result_list in (easy_results, tess_results):
         for item in result_list:
             if len(item) < 3:
@@ -784,14 +823,12 @@ def fuse_ocr_results(
             else:
                 old_conf = combined[key][2]
                 better   = max(conf, old_conf)
-                # Agreement boost: same text from multiple sources
                 boosted  = min(1.0, better * 1.10)
                 combined[key] = (
                     bbox if conf > old_conf else combined[key][0],
                     text if conf > old_conf else combined[key][1],
                     boosted,
                 )
-
     return list(combined.values())
 
 
@@ -812,13 +849,6 @@ def extract_best_plate_read(
     min_confidence: float       = 0.05,
     max_correction_score: float = 0.65,
 ) -> Optional[Tuple[str, float]]:
-    """
-    [PP-1] Domain-enforced corrector on every OCR candidate.
-    [PP-2] Correction-score confidence penalty.
-
-    min_confidence lowered to 0.05 to capture weak raw-path reads.
-    Returns (plate_text, adjusted_conf) or None.
-    """
     if not ocr_results:
         return None
 
@@ -829,7 +859,6 @@ def extract_best_plate_read(
             return 0.0
 
     sorted_results = sorted(ocr_results, key=top_y)
-
     raw_candidates = []
     for result in sorted_results:
         if len(result) < 3:
@@ -842,20 +871,15 @@ def extract_best_plate_read(
     if not raw_candidates:
         return None
 
-    # Also try merging all fragments into one candidate
     merged      = "".join(t for t, _ in raw_candidates)
     merged_conf = float(np.mean([c for _, c in raw_candidates]))
     raw_candidates.append((merged, merged_conf))
 
-    # [PP-1, PP-2] Apply domain corrector to every candidate
     corrected_candidates = correct_candidates(
-        raw_candidates,
-        max_correction_score=max_correction_score,
-    )
+        raw_candidates, max_correction_score=max_correction_score)
 
     if not corrected_candidates:
         return None
-
     return max(corrected_candidates, key=lambda x: x[1])
 
 
@@ -876,8 +900,6 @@ def _iou(a: Tuple, b: Tuple) -> float:
 
 
 class PlateTracker:
-    """[PL-1] Lightweight IoU tracker with province cache and OCR-skip state."""
-
     IOU_THRESHOLD = 0.35
     MAX_MISSED    = 8
 
@@ -889,19 +911,15 @@ class PlateTracker:
         tid = self._next_id
         self._next_id += 1
         self._tracks[tid] = {
-            "box":           box,
-            "missed":        0,
-            "province_info": None,
-            "last_ocr_box":  None,
+            "box": box, "missed": 0,
+            "province_info": None, "last_ocr_box": None,
         }
         return tid
 
     def update(self, boxes: List[Tuple]) -> List[Tuple[int, Tuple]]:
         for tid in self._tracks:
             self._tracks[tid]["missed"] += 1
-
         assignments, used_tids = [], set()
-
         for box in boxes:
             best_iou, best_tid = 0.0, None
             for tid, track in self._tracks.items():
@@ -910,7 +928,6 @@ class PlateTracker:
                 score = _iou(box, track["box"])
                 if score > best_iou:
                     best_iou, best_tid = score, tid
-
             if best_iou >= self.IOU_THRESHOLD and best_tid is not None:
                 self._tracks[best_tid]["box"]    = box
                 self._tracks[best_tid]["missed"] = 0
@@ -920,29 +937,26 @@ class PlateTracker:
                 tid = self._new_track(box)
                 used_tids.add(tid)
                 assignments.append((tid, box))
-
-        dead = [t for t, d in self._tracks.items()
-                if d["missed"] > self.MAX_MISSED]
+        dead = [t for t, d in self._tracks.items() if d["missed"] > self.MAX_MISSED]
         for tid in dead:
             del self._tracks[tid]
-
         return assignments
 
-    def get_province_cache(self, tid: int) -> Optional[dict]:
+    def get_province_cache(self, tid):
         return self._tracks.get(tid, {}).get("province_info")
 
-    def set_province_cache(self, tid: int, info):
+    def set_province_cache(self, tid, info):
         if tid in self._tracks:
             self._tracks[tid]["province_info"] = info
 
-    def get_last_ocr_box(self, tid: int) -> Optional[Tuple]:
+    def get_last_ocr_box(self, tid):
         return self._tracks.get(tid, {}).get("last_ocr_box")
 
-    def set_last_ocr_box(self, tid: int, box: Tuple):
+    def set_last_ocr_box(self, tid, box):
         if tid in self._tracks:
             self._tracks[tid]["last_ocr_box"] = box
 
-    def reset_track(self, tid: int):
+    def reset_track(self, tid):
         if tid in self._tracks:
             self._tracks[tid]["last_ocr_box"]  = None
             self._tracks[tid]["province_info"] = None
@@ -953,12 +967,9 @@ class PlateTracker:
 # ═══════════════════════════════════════════════════════════════════════════
 
 class PlateStabilityGate:
-    """[PL-3] Hysteresis: exit stable only after HYSTERESIS_COUNT bad frames."""
-
     HYSTERESIS_COUNT = 2
 
-    def __init__(self, min_stable_frames: int = 4,
-                 max_pixel_drift: float = 6.0):
+    def __init__(self, min_stable_frames: int = 4, max_pixel_drift: float = 6.0):
         self.min_stable_frames = min_stable_frames
         self.max_pixel_drift   = max_pixel_drift
         self._history: list    = []
@@ -966,7 +977,7 @@ class PlateStabilityGate:
         self._unstable_count   = 0
         self._is_stable        = False
 
-    def is_stable(self, x1: int, y1: int, x2: int, y2: int) -> bool:
+    def is_stable(self, x1, y1, x2, y2) -> bool:
         cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
         if self._history:
             px, py = self._history[-1]
@@ -977,17 +988,14 @@ class PlateStabilityGate:
             else:
                 self._unstable_count += 1
                 self._stable_count    = 0
-
         self._history.append((cx, cy))
         if len(self._history) > self.min_stable_frames + 1:
             self._history.pop(0)
-
         if self._stable_count >= self.min_stable_frames:
             self._is_stable = True
         if self._unstable_count >= self.HYSTERESIS_COUNT:
             self._is_stable    = False
             self._stable_count = 0
-
         return self._is_stable
 
     def reset(self):
@@ -998,96 +1006,147 @@ class PlateStabilityGate:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# WEIGHTED MAJORITY VOTER  [PL-2, PL-4]
+# WEIGHTED MAJORITY VOTER  [PL-2, PL-4, LLM-A, LLM-B]
 # ═══════════════════════════════════════════════════════════════════════════
 
 class PlateMajorityVoter:
     """
-    [PL-2] Weighted vote: yolo_conf × adjusted_ocr_conf, recency bonus.
-    [PP-3] Winner is re-validated via is_valid_plate() before return.
-    [PL-4] Partial-evidence accumulation:
-           Accumulates digit suffixes and consonant candidates from frames
-           where correct_plate() returned None. After MIN_DIGIT_VOTES
-           frames with the same digit suffix, attempts reconstruction via
-           merge_digit_evidence(). This is the key recovery path for
-           cases where binarization destroys consonants but digits survive.
+    Three-tier fallback voter.
+
+    Tier 1 [PL-2]  — Full-plate weighted majority vote.
+    Tier 2 [PL-4]  — Partial-evidence reconstruction.
+    Tier 3 [LLM-A,B] — LLM fallback (async).
+
+    [FIX-1] Consonant candidate extraction now preserves the optional
+    leading digit so "3กบ" is stored rather than just "กบ", enabling
+    correct reconstruction of plates like "3กบ7744".
     """
 
-    RECENCY_BONUS   = 0.10
-    MIN_DIGIT_VOTES = 5     # frames with same digit suffix before reconstruction
+    RECENCY_BONUS         = 0.10
+    MIN_DIGIT_VOTES       = 5
+    MIN_LLM_TRIGGER_VOTES = 8
 
-    def __init__(self, window: int = 8, min_votes: int = 3):
-        self.window    = window
-        self.min_votes = min_votes
+    def __init__(
+        self,
+        window: int    = 8,
+        min_votes: int = 3,
+        llm_corrector  = None,
+        track_id: int  = -1,
+    ):
+        self.window       = window
+        self.min_votes    = min_votes
+        self._llm         = llm_corrector
+        self._tid         = track_id
         self._buffer: List[Tuple[str, float, float]] = []
-        # [PL-4] Partial evidence stores
         self._digit_suffix_counter: Counter = Counter()
         self._consonant_candidates: list    = []
+        self._raw_ocr_seen: list            = []
+        self._frame_count: int              = 0
 
-    def update(
-        self,
-        candidate,
-        yolo_conf: float = 1.0,
-    ):
+    def update(self, candidate, yolo_conf: float = 1.0):
+        self._frame_count += 1
+
         if candidate is not None:
             text, ocr_conf = candidate
 
-            # [PL-4] Always try to extract digit evidence
+            # Track raw strings for LLM context [LLM-B]
+            norm = normalize_plate_text(text)
+            if norm and norm not in self._raw_ocr_seen:
+                self._raw_ocr_seen.append(norm)
+            if len(self._raw_ocr_seen) > 20:
+                self._raw_ocr_seen = self._raw_ocr_seen[-20:]
+
+            # [PL-4] digit suffix evidence
             digit_suffix = extract_digit_suffix(text)
             if digit_suffix:
                 self._digit_suffix_counter[digit_suffix] += 1
 
-            # [PL-4] Extract consonant portion (2-3 chars) if present
-            norm           = normalize_plate_text(text)
-            consonant_part = "".join(
-                c for c in norm if c in _CORRECTOR_CONSONANTS
-            )
-            if len(consonant_part) in (2, 3) and float(ocr_conf) > 0.15:
+            # ── [FIX-1] Consonant candidate extraction ─────────────────────
+            # Match optional leading digit + exactly 2 consonants from the
+            # normalised string.  This preserves "3กบ" instead of stripping
+            # the leading digit and only storing "กบ".
+            norm_for_cons = _normalise_raw(text)
+            m_cons = _CONS_PREFIX_RE.match(norm_for_cons)
+            if m_cons and float(ocr_conf) > 0.15:
+                # group(0) = full match, e.g. "3กบ" or "กบ"
+                consonant_part = m_cons.group(0)
                 if consonant_part not in self._consonant_candidates:
                     self._consonant_candidates.append(consonant_part)
 
-            # Full valid plate enters the voting buffer [PP-3]
+            # [FIX-2] Also store the entire plate as a consonant candidate
+            # when it is already valid, so Tier-2 reconstruction has access
+            # to the full prefix (including any leading digit) even before
+            # the Tier-1 window fills.
+            if is_valid_plate(text) and float(ocr_conf) > 0.15:
+                norm_valid = _normalise_raw(text)
+                # Extract consonant prefix of the valid plate
+                m_full = _CONS_PREFIX_RE.match(norm_valid)
+                if m_full:
+                    full_prefix = m_full.group(0)
+                    if full_prefix not in self._consonant_candidates:
+                        self._consonant_candidates.append(full_prefix)
+
+            # Full valid plate → voting buffer
             if is_valid_plate(text):
                 self._buffer.append((text, float(ocr_conf), float(yolo_conf)))
 
-        # ── Full-plate majority vote ───────────────────────────────────────
+        # ── Tier 1: full-plate majority vote ─────────────────────────────
         if len(self._buffer) >= self.window:
             half     = self.window // 2
             weighted = defaultdict(float)
             conf_acc = defaultdict(list)
-
             for idx, (text, ocr_conf, yc) in enumerate(self._buffer):
                 weight = yc * ocr_conf
                 if idx >= len(self._buffer) - half:
                     weight *= (1.0 + self.RECENCY_BONUS)
                 weighted[text]  += weight
                 conf_acc[text].append(ocr_conf)
-
             best_text  = max(weighted, key=weighted.__getitem__)
             vote_count = sum(1 for t, _, _ in self._buffer if t == best_text)
             avg_conf   = float(np.mean(conf_acc[best_text]))
             self._buffer.pop(0)
-
             if vote_count >= self.min_votes and is_valid_plate(best_text):
                 return (best_text, avg_conf)
 
-        # ── [PL-4] Partial-evidence reconstruction ────────────────────────
-        # Triggered when consonants are consistently destroyed by binarization
-        # but digits reliably survive (the most common failure mode observed)
+        # ── Tier 2: partial-evidence reconstruction [PL-4] ───────────────
         if self._digit_suffix_counter:
             best_suffix, suffix_count = self._digit_suffix_counter.most_common(1)[0]
-            if (suffix_count >= self.MIN_DIGIT_VOTES
-                    and self._consonant_candidates):
-                reconstructed = merge_digit_evidence(
-                    best_suffix, self._consonant_candidates
+            if suffix_count >= self.MIN_DIGIT_VOTES and self._consonant_candidates:
+                # Sort longest first so 3-char "3กบ" is tried before "กบ"
+                # merge_digit_evidence also sorts internally [PC-6], but
+                # sorting here too ensures the debug log shows the right order.
+                sorted_cons = sorted(
+                    self._consonant_candidates, key=len, reverse=True
                 )
+                reconstructed = merge_digit_evidence(best_suffix, sorted_cons)
                 if reconstructed:
-                    print(f"  [Voter PL-4] Reconstructed from partial evidence: "
+                    print(f"  [Voter PL-4 #{self._tid}] Reconstructed: "
                           f"{reconstructed[0]} "
-                          f"(digit_suffix={best_suffix} x{suffix_count}, "
-                          f"consonants={self._consonant_candidates})")
-                    # Penalised confidence — this is a reconstruction
+                          f"(suffix={best_suffix}×{suffix_count}, "
+                          f"consonants={sorted_cons})")
                     return (reconstructed[0], 0.45)
+
+            # ── Tier 3: LLM fallback [LLM-A, LLM-B] ─────────────────────
+            if (self._llm is not None
+                    and self._llm.is_enabled()
+                    and suffix_count >= self.MIN_LLM_TRIGGER_VOTES):
+
+                llm_result = self._llm.get_cached(self._tid)
+                if llm_result is not None:
+                    plate, conf = llm_result
+                    if is_valid_plate(plate):
+                        print(f"  [LLM-result #{self._tid}] "
+                              f"Using cached LLM result: {plate} conf={conf:.2f}")
+                        return (plate, conf)
+
+                if (not self._llm.is_pending(self._tid)
+                        and self._llm.get_cached(self._tid) is None):
+                    self._llm.request_async(
+                        tid              = self._tid,
+                        ocr_candidates   = self._raw_ocr_seen[-10:],
+                        prior_consonants = self._consonant_candidates,
+                        digit_suffix     = best_suffix,
+                    )
 
         return None
 
@@ -1095,3 +1154,7 @@ class PlateMajorityVoter:
         self._buffer.clear()
         self._digit_suffix_counter.clear()
         self._consonant_candidates.clear()
+        self._raw_ocr_seen.clear()
+        self._frame_count = 0
+        if self._llm is not None:
+            self._llm.clear_track(self._tid)

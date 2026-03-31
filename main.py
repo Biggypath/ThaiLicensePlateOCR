@@ -1,22 +1,19 @@
 """
 main.py — Thai licence-plate ALPR  (ESP32-CAM → YOLO → OCR → RabbitMQ)
 
-v9 changes vs v8  (see plate_utils.py and plate_corrector.py for detail):
-  [CV-6]  Multi-strategy binarization (Otsu + adaptive-Gaussian-31px +
-          adaptive-Mean-25px). Best strategy selected per frame by
-          connected-component plausibility score. Fixes the root cause:
-          11px adaptive kernel was destroying Thai consonant strokes.
-  [CV-7]  3×3 morphological closing (was 2×2) to reconnect Thai strokes.
-  [CV-8]  Tighter number-zone crop — cuts province strip more aggressively.
-  [CV-9]  Smart province-line detection via row-mean brightness scanning.
-  [OCR-5] Raw-color parallel EasyOCR path — runs on BGR crop without
-          binarization, normalised to 80px height.
-  [OCR-6] Beamsearch decoder (beamWidth=10) on raw path.
-  [PL-4]  Partial-evidence voter — accumulates digit suffix + consonant
-          candidates across frames for reconstruction when full OCR fails.
-  [PC-1]  extract_digit_suffix() helper in plate_corrector.
-  [PC-2]  merge_digit_evidence() helper in plate_corrector.
-  All v8 improvements retained.
+v10.1 changes vs v10  (see plate_utils.py for PROV-1…7 detail):
+  [PROV-7] PROVINCE FROM OCR TOKENS — after the three OCR engines run on
+           the number zone, every non-digit token is immediately tested
+           against normalize_province().  EasyOCR on the raw color crop
+           already reads province text as a second bounding box (e.g.
+           'กรทพมหวบกร' alongside '3กบ7744').  Mining these free tokens
+           avoids the separate province-strip binarization pass for the
+           majority of frames where the colour crop is clear enough.
+           The strip-based fallback [PROV-2…5] still runs when the token
+           mining produces no result.
+
+  [FIX-1,2] Leading-digit consonant bug fixed in plate_utils.py /
+            plate_corrector.py (see those files for detail).
 """
 
 import cv2
@@ -25,6 +22,7 @@ import os
 import glob
 import time
 import math
+from collections import deque
 from huggingface_hub import hf_hub_download
 from ultralytics import YOLO
 import easyocr
@@ -41,11 +39,14 @@ from plate_utils import (
     run_easyocr_raw,
     run_tesseract,
     extract_province_from_crop,
+    extract_province_from_ocr_tokens,   # [PROV-7]
+    normalize_plate_text,
     PlateTracker,
     PlateMajorityVoter,
     PlateStabilityGate,
 )
 from plate_corrector import is_valid_plate
+from llm_plate_corrector import LLMCorrector as LLMOCRFallback
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -83,6 +84,8 @@ _debug_save_count    = 0
 
 HF_REPO_ID           = "Rattatammanoon/hurricane-od-thai-plate-detector"
 HF_MODEL_FILENAME    = "HurricaneOD_beta.pt"
+
+LLM_CANDIDATE_HISTORY = 20
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -138,6 +141,11 @@ except Exception as exc:
     print(f"RabbitMQ failed: {exc}")
     raise SystemExit(1)
 
+print("Initialising LLM OCR fallback...")
+llm_fallback = LLMOCRFallback()
+print("LLM fallback ready." if llm_fallback._api_key else
+      "LLM fallback DISABLED (no API key).")
+
 
 # ══════════════════════════════════════════════════════════════════════════
 # 3. STREAM HELPERS
@@ -169,8 +177,9 @@ def save_debug(tag: str, raw_crop, preprocessed):
 # 4. PER-TRACK STATE  [PL-1]
 # ══════════════════════════════════════════════════════════════════════════
 
-_track_voters:    dict[int, PlateMajorityVoter] = {}
-_track_stability: dict[int, PlateStabilityGate] = {}
+_track_voters:    dict[int, PlateMajorityVoter]   = {}
+_track_stability: dict[int, PlateStabilityGate]   = {}
+_track_ocr_history: dict[int, deque] = {}
 
 
 def _get_voter(tid: int) -> PlateMajorityVoter:
@@ -189,9 +198,28 @@ def _get_stability(tid: int) -> PlateStabilityGate:
     return _track_stability[tid]
 
 
+def _get_ocr_history(tid: int) -> deque:
+    if tid not in _track_ocr_history:
+        _track_ocr_history[tid] = deque(maxlen=LLM_CANDIDATE_HISTORY)
+    return _track_ocr_history[tid]
+
+
+def _add_to_ocr_history(tid: int, ocr_results: list):
+    history  = _get_ocr_history(tid)
+    existing = set(history)
+    for item in ocr_results:
+        if len(item) >= 2:
+            text = str(item[1]).strip()
+            if text and text not in existing:
+                history.append(text)
+                existing.add(text)
+
+
 def _cleanup_track(tid: int):
     _track_voters.pop(tid, None)
     _track_stability.pop(tid, None)
+    _track_ocr_history.pop(tid, None)
+    llm_fallback.invalidate_track(tid)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -199,11 +227,6 @@ def _cleanup_track(tid: int):
 # ══════════════════════════════════════════════════════════════════════════
 
 def _get_yolo_conf(raw_boxes: list, yolo_confs: list, box: tuple) -> float:
-    """
-    Safely retrieve YOLO confidence for a given box.
-    Falls back to YOLO_CONF_THRESHOLD if box not found
-    (can happen for newly-created tracks that inherit a previously unseen box).
-    """
     try:
         idx = raw_boxes.index(box)
         return yolo_confs[idx]
@@ -212,7 +235,68 @@ def _get_yolo_conf(raw_boxes: list, yolo_confs: list, box: tuple) -> float:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 6. MAIN LOOP
+# 6. PLATE PUBLISHING HELPER
+# ══════════════════════════════════════════════════════════════════════════
+
+def _publish_and_display(
+    frame,
+    tid: int,
+    x1: int, y1: int, x2: int, y2: int,
+    plate_text: str,
+    ocr_conf: float,
+    yolo_conf: float,
+    province_info,
+    source: str = "voter",
+):
+    global rmq_conn, rmq_channel
+
+    province_thai   = province_info["thai"]   if province_info else None
+    province_en     = province_info["en"]     if province_info else None
+    province_region = province_info["region"] if province_info else None
+
+    print(f"✅  [#{tid}] {plate_text}  source={source}  "
+          f"province={province_thai} ({province_en})  "
+          f"YOLO={yolo_conf:.2f}  OCR≈{ocr_conf:.2f}")
+
+    payload = {
+        "timestamp"       : int(time.time()),
+        "plate_text"      : plate_text,
+        "province_thai"   : province_thai,
+        "province_en"     : province_en,
+        "province_region" : province_region,
+        "yolo_confidence" : round(yolo_conf, 4),
+        "ocr_confidence"  : round(float(ocr_conf), 4),
+        "camera_id"       : "esp32_cam_gate_1",
+        "track_id"        : tid,
+        "ocr_source"      : source,
+    }
+    json_payload = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+    try:
+        publish_plate(rmq_channel, json_payload)
+        print(f"  Published: {json.dumps(payload, ensure_ascii=False)}")
+    except Exception:
+        print("RabbitMQ lost — reconnecting...")
+        try:
+            if rmq_conn and rmq_conn.is_open:
+                rmq_conn.close()
+        except Exception:
+            pass
+        rmq_conn, rmq_channel = connect_rabbitmq()
+        publish_plate(rmq_channel, json_payload)
+
+    colour = (0, 255, 0) if source == "voter" else (255, 180, 0)
+    label  = (f"#{tid} {plate_text}  {province_en}"
+              if province_en else f"#{tid} {plate_text}")
+    if source == "llm_fallback":
+        label += " [LLM]"
+    cv2.rectangle(frame, (x1, y1), (x2, y2), colour, 2)
+    cv2.putText(frame, label, (x1, y1 - 8),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, colour, 2, cv2.LINE_AA)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 7. MAIN LOOP
 # ══════════════════════════════════════════════════════════════════════════
 
 cap              = None
@@ -254,7 +338,6 @@ while True:
         print(f"YOLO error: {exc}")
         continue
 
-    # ── Gather boxes → tracker  [PL-1] ────────────────────────────────────
     fh, fw     = frame.shape[:2]
     raw_boxes  = []
     yolo_confs = []
@@ -294,6 +377,30 @@ while True:
             if math.hypot(cx - (lx1 + lx2) / 2,
                           cy - (ly1 + ly2) / 2) < OCR_SKIP_DRIFT:
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 165, 255), 1)
+                llm_result = llm_fallback.query(
+                    track_id         = tid,
+                    ocr_candidates   = list(_get_ocr_history(tid)),
+                    prior_consonants = voter._consonant_candidates,
+                )
+                if llm_result is not None:
+                    plate_text, llm_conf = llm_result
+                    current_time = time.time()
+                    if (is_valid_plate(plate_text)
+                            and should_send_plate(plate_text, last_seen_plates,
+                                                  current_time, COOLDOWN_TIME)):
+                        last_seen_plates[plate_text] = current_time
+                        province_info = tracker.get_province_cache(tid)
+                        if province_info is False:
+                            province_info = None
+                        voter.reset()
+                        stability.reset()
+                        tracker.reset_track(tid)
+                        _cleanup_track(tid)
+                        _publish_and_display(
+                            frame, tid, x1, y1, x2, y2,
+                            plate_text, llm_conf, yolo_conf,
+                            province_info, source="llm_fallback",
+                        )
                 continue
 
         tracker.set_last_ocr_box(tid, (x1, y1, x2, y2))
@@ -305,23 +412,7 @@ while True:
         # ── Step 1: deskew  [CV-5] ─────────────────────────────────────────
         plate_crop = deskew_plate(plate_crop)
 
-        # ── Step 2: province detection  [PF-3] cached per track ───────────
-        province_info = tracker.get_province_cache(tid)
-        if province_info is None:
-            province_info = extract_province_from_crop(
-                plate_crop, easyocr_reader=reader,
-            )
-            tracker.set_province_cache(tid, province_info or False)
-        elif province_info is False:
-            province_info = None
-
-        if province_info:
-            print(f"  [#{tid}] Province: {province_info['thai']} "
-                  f"({province_info['en']}) score={province_info['score']:.2f}")
-        else:
-            print(f"  [#{tid}] Province: unknown")
-
-        # ── Step 3: preprocess  [CV-1, CV-4, CV-6, CV-7, CV-8, CV-9] ──────
+        # ── Step 2: preprocess  [CV-1, CV-4, CV-6, CV-7, CV-8, CV-9] ──────
         try:
             preprocessed = preprocess_plate_image(
                 plate_crop,
@@ -332,23 +423,17 @@ while True:
             print(f"  [#{tid}] Preprocess error: {exc}")
             continue
 
-        # ── Step 4: three OCR paths  [OCR-1, OCR-5, OCR-6] ────────────────
-        # Path A: EasyOCR on binarized/preprocessed image (existing)
+        # ── Step 3: three OCR paths  [OCR-1, OCR-5, OCR-6] ────────────────
         easy_results_prep = run_easyocr(reader, preprocessed)
+        easy_results_raw  = run_easyocr_raw(reader, plate_crop)
+        tess_results      = run_tesseract(preprocessed)
 
-        # Path B: EasyOCR on raw BGR crop — NEW [OCR-5]
-        # This is the critical fix: raw image preserves Thai consonant detail
-        # that binarization destroys. Both paths are fused before correction.
-        easy_results_raw = run_easyocr_raw(reader, plate_crop)
+        _add_to_ocr_history(tid, easy_results_prep + easy_results_raw + tess_results)
 
-        # Path C: Tesseract on preprocessed image [PF-2]
-        tess_results = run_tesseract(preprocessed)
+        min_conf = adaptive_min_confidence(yolo_conf)
 
-        min_conf = adaptive_min_confidence(yolo_conf)   # [OCR-2]
-
-        # Fuse all three paths — agreement between any two boosts confidence
         fused = fuse_ocr_results(
-            easy_results_prep + easy_results_raw,   # merged EasyOCR paths
+            easy_results_prep + easy_results_raw,
             tess_results,
             min_confidence=min_conf,
         )
@@ -359,6 +444,34 @@ while True:
               f"{[(r[1], round(float(r[2]), 2)) for r in easy_results_raw]}")
         print(f"  [#{tid}] Tesseract:    "
               f"{[(r[1], round(float(r[2]), 2)) for r in tess_results]}")
+
+        # ── Step 4: province detection — OCR token mining first  [PROV-7] ──
+        # Mine province text from the tokens already collected in Step 3.
+        # EasyOCR on the raw color crop frequently reads the province line
+        # as a second bounding box (e.g. 'กรทพมหวบกร' at conf 0.42).
+        # This is free; no extra OCR call is needed.
+        province_info = tracker.get_province_cache(tid)
+        if province_info is None:
+            # [PROV-7] Try token mining first (fast, free)
+            all_tokens = easy_results_prep + easy_results_raw + tess_results
+            province_info = extract_province_from_ocr_tokens(all_tokens)
+
+            if province_info is None:
+                # [PROV-2…5] Fallback: dedicated multi-strategy strip scan
+                province_info = extract_province_from_crop(
+                    plate_crop, easyocr_reader=reader,
+                )
+
+            tracker.set_province_cache(tid, province_info or False)
+
+        elif province_info is False:
+            province_info = None
+
+        if province_info:
+            print(f"  [#{tid}] Province: {province_info['thai']} "
+                  f"({province_info['en']}) score={province_info['score']:.2f}")
+        else:
+            print(f"  [#{tid}] Province: unknown")
 
         # ── Step 5: domain-enforced post-processing  [PP-1, PP-2] ─────────
         candidate = extract_best_plate_read(
@@ -373,72 +486,77 @@ while True:
 
         # ── Step 6: weighted majority vote + partial evidence  [PL-2, PL-4] ─
         winner = voter.update(candidate, yolo_conf=yolo_conf)
-        if winner is None:
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 165, 255), 2)
-            continue
 
-        plate_text, ocr_conf = winner
-        current_time = time.time()
+        if winner is not None:
+            plate_text, ocr_conf = winner
+            current_time = time.time()
 
-        # ── [PP-3] Final valid-plate gate ──────────────────────────────────
-        if not is_valid_plate(plate_text):
-            print(f"  [#{tid}] Voter winner failed validation: {plate_text!r}")
-            continue
+            if not is_valid_plate(plate_text):
+                print(f"  [#{tid}] Voter winner failed validation: {plate_text!r}")
+                continue
 
-        if not should_send_plate(plate_text, last_seen_plates,
-                                 current_time, COOLDOWN_TIME):
-            print(f"  [#{tid}] [{plate_text}] in cooldown.")
+            if not should_send_plate(plate_text, last_seen_plates,
+                                     current_time, COOLDOWN_TIME):
+                print(f"  [#{tid}] [{plate_text}] in cooldown.")
+                voter.reset()
+                stability.reset()
+                tracker.reset_track(tid)
+                continue
+
+            last_seen_plates[plate_text] = current_time
+            province_info_pub = tracker.get_province_cache(tid)
+            if province_info_pub is False:
+                province_info_pub = None
             voter.reset()
             stability.reset()
             tracker.reset_track(tid)
-            continue
+            _cleanup_track(tid)
 
-        # ── Step 7: build & publish payload ───────────────────────────────
-        province_thai   = province_info["thai"]   if province_info else None
-        province_en     = province_info["en"]     if province_info else None
-        province_region = province_info["region"] if province_info else None
+            _publish_and_display(
+                frame, tid, x1, y1, x2, y2,
+                plate_text, ocr_conf, yolo_conf,
+                province_info_pub, source="voter",
+            )
 
-        print(f"✅  [#{tid}] {plate_text}  "
-              f"province={province_thai} ({province_en})  "
-              f"YOLO={yolo_conf:.2f}  OCR≈{ocr_conf:.2f}")
+        else:
+            # ── LLM fallback [LLM-1] ──────────────────────────────────────
+            llm_result = llm_fallback.query(
+                track_id         = tid,
+                ocr_candidates   = list(_get_ocr_history(tid)),
+                prior_consonants = voter._consonant_candidates,
+            )
 
-        last_seen_plates[plate_text] = current_time
-        voter.reset()
-        stability.reset()
-        tracker.reset_track(tid)
+            if llm_result is not None:
+                plate_text, llm_conf = llm_result
+                current_time = time.time()
 
-        payload = {
-            "timestamp"       : int(current_time),
-            "plate_text"      : plate_text,
-            "province_thai"   : province_thai,
-            "province_en"     : province_en,
-            "province_region" : province_region,
-            "yolo_confidence" : round(yolo_conf, 4),
-            "ocr_confidence"  : round(float(ocr_conf), 4),
-            "camera_id"       : "esp32_cam_gate_1",
-            "track_id"        : tid,
-        }
-        json_payload = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                if not is_valid_plate(plate_text):
+                    print(f"  [#{tid}] LLM result failed validation: "
+                          f"{plate_text!r} — discarded")
+                elif not should_send_plate(plate_text, last_seen_plates,
+                                           current_time, COOLDOWN_TIME):
+                    print(f"  [#{tid}] [{plate_text}] in cooldown (LLM).")
+                    voter.reset()
+                    stability.reset()
+                    tracker.reset_track(tid)
+                    _cleanup_track(tid)
+                else:
+                    last_seen_plates[plate_text] = current_time
+                    province_info_pub = tracker.get_province_cache(tid)
+                    if province_info_pub is False:
+                        province_info_pub = None
+                    voter.reset()
+                    stability.reset()
+                    tracker.reset_track(tid)
+                    _cleanup_track(tid)
 
-        try:
-            publish_plate(rmq_channel, json_payload)
-            print(f"  Published: {json.dumps(payload, ensure_ascii=False)}")
-        except Exception:
-            print("RabbitMQ lost — reconnecting...")
-            try:
-                if rmq_conn and rmq_conn.is_open:
-                    rmq_conn.close()
-            except Exception:
-                pass
-            rmq_conn, rmq_channel = connect_rabbitmq()
-            publish_plate(rmq_channel, json_payload)
-
-        label = (f"#{tid} {plate_text}  {province_en}"
-                 if province_en else f"#{tid} {plate_text}")
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-        cv2.putText(frame, label, (x1, y1 - 8),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2,
-                    cv2.LINE_AA)
+                    _publish_and_display(
+                        frame, tid, x1, y1, x2, y2,
+                        plate_text, llm_conf, yolo_conf,
+                        province_info_pub, source="llm_fallback",
+                    )
+            else:
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 165, 255), 2)
 
     cv2.imshow("ESP32-CAM ALPR", frame)
     if cv2.waitKey(1) & 0xFF == ord('q'):
@@ -446,7 +564,7 @@ while True:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 7. CLEANUP
+# 8. CLEANUP
 # ══════════════════════════════════════════════════════════════════════════
 
 if cap:

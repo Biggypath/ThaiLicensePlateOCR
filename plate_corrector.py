@@ -1,40 +1,31 @@
 """
-plate_corrector.py — Strict Thai Licence-Plate Format Corrector  (v9)
+plate_corrector.py — Strict Thai Licence-Plate Format Corrector  (v9.1)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-CHANGES vs v8
+CHANGES vs v9
 ─────────────
-  [PC-1]  extract_digit_suffix() — pull reliable 4-digit suffix from
-          partial/noisy OCR strings even when consonants are gone.
-          Used by PlateMajorityVoter for partial-evidence accumulation.
+  [PC-6]  merge_digit_evidence() now returns results sorted by SPECIFICITY:
+          candidates with a leading digit (length-3 prefix like "3กบ")
+          rank BEFORE bare 2-consonant candidates ("กบ"), so the voter
+          always reconstructs the more-specific plate (e.g. "3กบ7744"
+          beats "กบ7744") when both are valid.
 
-  [PC-2]  merge_digit_evidence() — combine a confirmed digit suffix with
-          consonant candidates seen across frames to reconstruct plates.
-
-  [PC-3]  Pass C extended — improved positional aligner handles 8-char
-          noisy strings (province bleed + plate) by first stripping
-          any leading Thai vowel/non-consonant chars.
-
-  [PC-4]  Pass D extended — handles length-8 all-digit strings that
-          include a spurious leading digit from YOLO crop bleed.
-
-  [PC-5]  normalise_raw() now strips Thai vowel diacritics that bleed
-          from the province strip into the number zone read.
+  All v9 improvements retained:
+  [PC-1]  extract_digit_suffix()
+  [PC-2]  merge_digit_evidence() base logic
+  [PC-3]  Pass C extended
+  [PC-4]  Pass D extended
+  [PC-5]  normalise_raw() diacritic stripping
 
 THAI PLATE DOMAIN RULES
 ────────────────────────
 Standard passenger plate: [optional 1 digit] [exactly 2 consonants] [exactly 4 digits]
   กข1234          ✓
   1กข1234         ✓
+  3กบ7744         ✓  leading zone digit preserved
   กข12            ✗  too few digits
   3บ3099          ✗  only 1 consonant — needs correction
   ฐบ3699          ✓  correct
-
-CHARACTER CONFUSION MAPS
-────────────────────────
-Digit  → Thai consonant : used when a position MUST hold a consonant
-Thai   → Digit          : used when a position MUST hold a digit
-Latin  → Thai consonant : EasyOCR sometimes returns Latin for Thai
 """
 
 import re
@@ -381,7 +372,7 @@ def _pass_e(text: str) -> Optional[str]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# PARTIAL EVIDENCE HELPERS  [PC-1, PC-2]
+# PARTIAL EVIDENCE HELPERS  [PC-1, PC-2, PC-6]
 # ═══════════════════════════════════════════════════════════════════════════
 
 def extract_digit_suffix(text: str) -> Optional[str]:
@@ -430,8 +421,13 @@ def merge_digit_evidence(
     consonant_candidates: list,
 ) -> list:
     """
-    [PC-2] Combine a confirmed digit suffix with consonant candidates
+    [PC-2, PC-6] Combine a confirmed digit suffix with consonant candidates
     observed across frames in the same track to produce full plate strings.
+
+    [PC-6] Results are sorted by SPECIFICITY — candidates with a leading
+    digit (3-char prefix like "3กบ") rank BEFORE bare 2-consonant
+    candidates ("กบ").  This ensures the more-specific plate (e.g.
+    "3กบ7744") is always returned first and used by the voter.
 
     Parameters
     ----------
@@ -439,34 +435,36 @@ def merge_digit_evidence(
     consonant_candidates: list of 2- or 3-char strings containing
                           Thai consonants (possibly with leading digit)
 
-    Returns list of valid plate strings, most likely first.
+    Returns list of valid plate strings, most specific (longest) first.
     """
     if not digit_suffix or len(digit_suffix) != 4:
         return []
     if not digit_suffix.isdigit():
         return []
 
-    results = []
-    seen    = set()
+    with_leading:    list[str] = []   # leading digit present — more specific
+    without_leading: list[str] = []   # bare consonant pair
+    seen:            set[str]  = set()
 
     for cons in consonant_candidates:
         # 2-consonant case: กข + 1234
         if len(cons) == 2 and all(c in _CONSONANT_SET for c in cons):
             candidate = cons + digit_suffix
             if _PLATE_RE.fullmatch(candidate) and candidate not in seen:
-                results.append(candidate)
+                without_leading.append(candidate)
                 seen.add(candidate)
 
-        # 3-char case: leading digit + 2 consonants (e.g. "1กข")
+        # 3-char case: leading digit + 2 consonants (e.g. "3กบ")
         elif (len(cons) == 3
               and cons[0].isdigit()
               and all(c in _CONSONANT_SET for c in cons[1:])):
             candidate = cons + digit_suffix
             if _PLATE_RE.fullmatch(candidate) and candidate not in seen:
-                results.append(candidate)
+                with_leading.append(candidate)
                 seen.add(candidate)
 
-    return results
+    # [PC-6] More-specific (leading-digit) results first
+    return with_leading + without_leading
 
 
 # ═══════════════════════════════════════════════════════════════════════════
