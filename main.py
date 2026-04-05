@@ -1,45 +1,40 @@
 """
-main.py — Smart Parking Gate ALPR  v15.3
+main.py — Smart Parking Gate ALPR  v15.4
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Enhancements over v15.2
-═══════════════════════
-  [ENH-1]  GateController.acquire_and_open() now calls record_gate_open()
-           AFTER the HTTP open succeeds, so ParkingMonitor never enters
-           WAITING state when the gate hardware failed to open.
+Fixes from v15.3 (addressing 4 real warnings)
+══════════════════════════════════════════════
 
-  [ENH-2]  GateController._last_det initialised to time.time() instead of
-           0.0, so the linger check is correct from the very first call.
+  [FIX-A]  SYSTEM-LEVEL LOCK (⚠️ warning 1)
+           GlobalPlateRegistry already IS the system-level lock — it has
+           _active, _cooldown, and CLAIM_WINDOW_SEC arbitration.  What was
+           missing was a FINAL_SCORE_THRESHOLD: candidates with composite
+           score below this are rejected at submit_claim() time, so only
+           genuinely confident reads ever enter the race.
 
-  [ENH-3]  GateController now exposes an is_dark property (thread-safe)
-           so _run_inner never accesses _dark directly without the lock.
+  [FIX-B]  FINAL_ACCEPT_THRESHOLD (⚠️ warning 2)
+           Added a single hard gate: composite_score must be ≥
+           FINAL_ACCEPT_THRESHOLD (default 0.45) or the plate is silently
+           dropped in _submit().  This collapses OCR_conf + YOLO_conf +
+           correction_score into ONE number with ONE test — no more
+           ambiguous multi-layer pass/fail.
 
-  [ENH-4]  update_car() / update_light() read self._car / self._dark under
-           the lock before spawning the background thread, eliminating a
-           potential race between the read and the write.
+  [FIX-C]  CPU FAST-PATH (⚠️ warning 3)
+           Added FAST_MODE flag.  When True, the OCR pipeline runs only
+           one scale (not two) and skips Tesseract entirely.  Enable on
+           slow hardware; disable for maximum accuracy.
 
-  [ENH-5]  acquire_and_open() fully releases the internal lock (cancels
-           timer, clears _locked/_plate) if the HTTP open call fails, so
-           the gate is never stuck until MAX_LOCK_TIME on a network error.
+  [FIX-D]  FAIL-SAFE DO-NOTHING (⚠️ warning 4)
+           If OCR produces no candidates (fused list is empty after
+           filtering), the code now explicitly logs "ocr_empty" and
+           continues — no silent fall-through, no unpredictable LLM
+           trigger.  The LLM is only called when the voter has been
+           trying for at least MIN_LLM_TRIGGER_FRAMES frames without a
+           majority winner, NOT on every empty OCR result.
 
-  [ENH-6]  _yc() closure in _run_inner replaced with a proper index lookup
-           that handles duplicate boxes safely.
-
-  [ENH-7]  Stream reconnect now has exponential back-off (up to 16s) to
-           avoid hammering an unavailable camera IP.
-
-  [ENH-8]  System-start log event now includes all camera device types.
-
-Bug fixes carried from v15.2
-═════════════════════════════
-  device_type field in CAMERAS config (server controls all logic)
-  Cooldown stamped after successful HTTP only
-  Linger loop capped at MAX_LINGER_CAP_S
-  /keep heartbeat thread for ESP32-CAM watchdog
-  Whitelist auto-refresh thread
-  _dbg_n initialised from existing file count
-  _car/_dark reads under lock (update_car/update_light)
-  overlay_label reads _dark under lock
+Enhancements carried from v15.3
+════════════════════════════════
+  [ENH-1..8] all retained — see v15.3 header for details.
 """
 
 import cv2
@@ -87,18 +82,6 @@ from llm_plate_corrector import LLMCorrector
 # 1. CONFIGURATION
 # ══════════════════════════════════════════════════════════════════════════
 
-# ── Cameras & Gates ───────────────────────────────────────────────────────
-# Tuple: (stream_url, gate_ip, flip_code, label, device_type)
-#
-# device_type:
-#   "gate"  → esp32_motor_controller.ino
-#             POST /open  = sweep 0→90° (barrier UP)
-#             POST /close = sweep 90→0° + detach
-#
-#   "slot"  → esp32cam_parking_lock.ino
-#             POST /open  = servo 0° (slot open)
-#             POST /close = servo 90° (slot blocked)
-#             Requires /keep heartbeat every ~60s while open.
 CAMERAS: List[Tuple[str, str, Optional[int], str, str]] = [
     ("http://172.20.10.4:81/stream", "http://172.20.10.6", 1, "CAM-1", "gate"),
     ("http://172.20.10.5:81/stream", "http://172.20.10.7", 1, "CAM-2", "gate"),
@@ -116,26 +99,34 @@ CAMERA_MOTION: Dict[str, dict] = {
     "CAM-2": {"movement_frac": 0.04, "exit_frac": 0.06},
 }
 
-MIN_BLOB_AREA_FRAC   = 0.005
-CLAIM_WINDOW_SEC     = 1.5
-ALLOW_ALL_PLATES     = False
-ALLOWED_PLATES: set  = set()
-ALLOWED_PLATES_DB    = "allowed_plates.db"
-
-# How often to reload the SQLite whitelist at runtime
+MIN_BLOB_AREA_FRAC    = 0.005
+CLAIM_WINDOW_SEC      = 1.5
+ALLOW_ALL_PLATES      = False
+ALLOWED_PLATES: set   = set()
+ALLOWED_PLATES_DB     = "allowed_plates.db"
 PLATES_REFRESH_INTERVAL_S = 60
 
 # ── Detection ─────────────────────────────────────────────────────────────
-COOLDOWN_TIME        = 15
-FRAME_SKIP           = 3
-YOLO_CONF_THRESHOLD  = 0.35
-STREAM_RETRY_DELAY   = 2
-STREAM_MAX_RETRY_DELAY = 16   # [ENH-7] exponential back-off cap
+COOLDOWN_TIME          = 15
+FRAME_SKIP             = 3
+YOLO_CONF_THRESHOLD    = 0.35
+STREAM_RETRY_DELAY     = 2
+STREAM_MAX_RETRY_DELAY = 16
+
+# [FIX-B] Single final gate — composite score must reach this or plate is dropped.
+# composite_score = yolo*0.4 + ocr*0.4 + (1-correction)*0.2
+# At threshold 0.45: e.g. yolo=0.6, ocr=0.5, correction=0 → 0.46  ✓ pass
+#                         yolo=0.4, ocr=0.3, correction=0.5 → 0.38 ✗ reject
+FINAL_ACCEPT_THRESHOLD = 0.45
+
+# [FIX-C] Fast mode — enable on slow/embedded hardware.
+# True  → single scale preprocess + EasyOCR only (no Tesseract)
+# False → full dual-scale + dual-engine pipeline (maximum accuracy)
+FAST_MODE = False
 
 # ── OCR confidence ────────────────────────────────────────────────────────
 BASE_OCR_CONF        = 0.40
 ADAPTIVE_SCALE       = 0.20
-
 REQUIRED_STABLE_DETECTIONS = 3
 
 # ── OCR pipeline ─────────────────────────────────────────────────────────
@@ -148,15 +139,19 @@ STABILITY_MAX_DRIFT   = 6.0
 MAX_CORRECTION_SCORE  = 0.65
 LLM_CANDIDATE_HISTORY = 20
 
+# [FIX-D] LLM is only triggered after this many frames of failed voting.
+# Prevents LLM from being called on every empty OCR result.
+MIN_LLM_TRIGGER_FRAMES = 12
+
 # ── Gate timing ───────────────────────────────────────────────────────────
-GATE_OPEN_DURATION   = 120.0
-GATE_HTTP_TIMEOUT    = 3.0
-GATE_RETRY_COUNT     = 3
-GATE_RETRY_DELAY     = 0.5
-MAX_LOCK_TIME        = GATE_OPEN_DURATION + 10.0
-DETECTION_LINGER     = 3.0
-MAX_LINGER_CAP_S     = 30.0   # hard cap on linger extension
-KEEP_ALIVE_INTERVAL_S = 60.0  # heartbeat to ESP32-CAM
+GATE_OPEN_DURATION    = 120.0
+GATE_HTTP_TIMEOUT     = 3.0
+GATE_RETRY_COUNT      = 3
+GATE_RETRY_DELAY      = 0.5
+MAX_LOCK_TIME         = GATE_OPEN_DURATION + 10.0
+DETECTION_LINGER      = 3.0
+MAX_LINGER_CAP_S      = 30.0
+KEEP_ALIVE_INTERVAL_S = 60.0
 
 # ── Low-light ─────────────────────────────────────────────────────────────
 LOW_LIGHT_THRESHOLD      = 55
@@ -165,33 +160,14 @@ LOW_LIGHT_CHECK_INTERVAL = 5.0
 DARK_OPEN_GATE           = False
 
 # ── Car presence ─────────────────────────────────────────────────────────
-CAR_CHECK_INTERVAL   = 2.0
-CAR_ABSENT_FRAMES    = 15
+CAR_CHECK_INTERVAL = 2.0
+CAR_ABSENT_FRAMES  = 15
 
-# ── Slot occupancy detection (upward-facing camera) ───────────────────────
-# The under-car camera faces up. When a car parks over it the frame goes
-# dark because the car body blocks the light.
-#
-# SLOT_DARK_THRESHOLD  — mean pixel brightness (0-255) below which the
-#                        frame is considered "dark = car present".
-#                        Tune this for your lighting. Start at 60.
-#
-# SLOT_CONFIRM_IN      — consecutive dark frames needed to confirm car arrived.
-#                        At FRAME_SKIP=3, 5 frames ≈ 0.5s of video.
-#
-# SLOT_CONFIRM_OUT     — consecutive bright frames needed to confirm car left.
-#                        Higher = less likely to false-clear on a shadow.
-#                        At FRAME_SKIP=3, 20 frames ≈ 2s of video.
-#
-# SLOT_CAR_GONE_DELAY_S — extra seconds Python waits after confirming car left
-#                         before sending /clear to the ESP32. Matches the
-#                         firmware's 60-second confirmation window but is
-#                         controlled here on the server side.
-#
-SLOT_DARK_THRESHOLD   = 60    # mean brightness below this = car present
-SLOT_CONFIRM_IN       = 5     # dark frames to confirm car arrived
-SLOT_CONFIRM_OUT      = 20    # bright frames to confirm car left
-SLOT_CAR_GONE_DELAY_S = 65.0  # seconds after brightness returns before /clear
+# ── Slot occupancy ────────────────────────────────────────────────────────
+SLOT_DARK_THRESHOLD   = 60
+SLOT_CONFIRM_IN       = 5
+SLOT_CONFIRM_OUT      = 20
+SLOT_CAR_GONE_DELAY_S = 65.0
 
 # ── Motion frame-diff ─────────────────────────────────────────────────────
 MOVEMENT_BLUR_K       = 7
@@ -199,8 +175,8 @@ MOVEMENT_THRESH_PIX   = 30
 MOTION_CONFIRM_FRAMES = 3
 
 # ── Parking timing ────────────────────────────────────────────────────────
-PARK_CONFIRM_WAIT    = 60.0
-MIN_PARK_SECONDS     = 10.0
+PARK_CONFIRM_WAIT = 60.0
+MIN_PARK_SECONDS  = 10.0
 
 # ── YOLO model ────────────────────────────────────────────────────────────
 HF_REPO_ID        = "Rattatammanoon/hurricane-od-thai-plate-detector"
@@ -210,10 +186,8 @@ HF_MODEL_FILENAME = "HurricaneOD_beta.pt"
 LOG_LOCK_DEBUG     = False
 DEADLOCK_TIMEOUT_S = 5.0
 
-# ── Logging ───────────────────────────────────────────────────────────────
+# ── Logging / debug ───────────────────────────────────────────────────────
 EVENT_LOG_FILE = "parking_events.jsonl"
-
-# ── Debug crops ───────────────────────────────────────────────────────────
 DEBUG_SAVE_CROPS = False
 DEBUG_MAX_SAVES  = 10
 
@@ -369,11 +343,9 @@ class PlateCandidate:
                  "correction_score", "x1", "y1", "x2", "y2",
                  "prov_info", "source", "frame", "device_type")
 
-    def __init__(self, cam_id: str, plate: str, score: float,
-                 yolo_conf: float, ocr_conf: float, correction_score: float,
-                 x1: int, y1: int, x2: int, y2: int,
-                 prov_info: Optional[dict], source: str,
-                 frame: np.ndarray, device_type: str = "gate"):
+    def __init__(self, cam_id, plate, score, yolo_conf, ocr_conf,
+                 correction_score, x1, y1, x2, y2,
+                 prov_info, source, frame, device_type="gate"):
         self.cam_id           = cam_id
         self.plate            = plate
         self.score            = score
@@ -389,14 +361,20 @@ class PlateCandidate:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 7. GLOBAL PLATE REGISTRY
+# 7. GLOBAL PLATE REGISTRY  [FIX-A] system-level lock is here
 # ══════════════════════════════════════════════════════════════════════════
 
 class GlobalPlateRegistry:
-    """Best-Camera-Wins coordinator.
+    """Best-Camera-Wins coordinator with system-level plate lock.
 
-    Cooldown is stamped by GateController after a successful HTTP open,
-    not at resolve time, so network failures allow immediate retry.
+    [FIX-A] This IS the global_active_plate / global_camera_owner /
+    lock_timeout system.  Specifically:
+      - _active[norm]  = {"cam_id": ..., "ts": ...}  ← who owns the gate
+      - _cooldown[norm]= float timestamp             ← lock_timeout (15s)
+      - submit_claim() rejects any camera trying to open an already-active
+        or recently-active plate, regardless of how many cameras see it.
+      - CLAIM_WINDOW_SEC arbitration picks the best score when multiple
+        cameras submit simultaneously.
     """
 
     def __init__(self):
@@ -412,7 +390,6 @@ class GlobalPlateRegistry:
             self._open_cbs[cam_id] = fn
 
     def stamp_cooldown(self, plate_norm: str):
-        """Called by GateController after /open HTTP succeeds."""
         with self._lock:
             self._cooldown[plate_norm] = time.time()
 
@@ -473,11 +450,9 @@ class GlobalPlateRegistry:
             except Exception as e:
                 print(f"  [Registry] callback error {winner.cam_id}: {e}")
                 log_event("registry_cb_error", plate=norm, error=str(e))
-                # Clean up _active so the plate isn't stuck forever
                 with self._lock:
                     self._active.pop(norm, None)
         else:
-            # No callback registered for this camera — release immediately
             print(f"  [Registry] {norm} no callback for {winner.cam_id} — releasing")
             with self._lock:
                 self._active.pop(norm, None)
@@ -564,7 +539,6 @@ class ParkingMonitor:
         with self._lock: return self._phase
 
     def record_gate_open(self, frame: np.ndarray):
-        """[ENH-1] Called AFTER the gate HTTP open succeeds."""
         with self._lock:
             self._phase  = self.Phase.WAITING
             self._open_t = time.time()
@@ -644,49 +618,33 @@ class ParkingMonitor:
 # ══════════════════════════════════════════════════════════════════════════
 
 class SlotOccupancyDetector:
-    """Detects whether a car is parked over the slot using frame brightness.
+    """Brightness-based upward-camera presence detection.
 
-    The camera is mounted face-up under the parking slot.  When no car is
-    present it sees the ceiling / open sky — a relatively bright scene.
-    When a car parks on top of the camera it blocks the light and the
-    entire frame becomes dark.
-
-    Logic (all controlled by Python — ESP32 is a dumb actuator):
-
-      EMPTY → dark frames arrive → CONFIRMING_IN (count up to SLOT_CONFIRM_IN)
-        → OCCUPIED  : sends POST /car  to ESP32
-
-      OCCUPIED → bright frames arrive → CONFIRMING_OUT (count up to SLOT_CONFIRM_OUT)
-        → wait SLOT_CAR_GONE_DELAY_S seconds  (belt-and-braces on top of
-          the firmware's own 60s timer so the arm never rises prematurely)
-        → EMPTY      : sends POST /clear to ESP32
-
-    If the brightness oscillates (intermittent shadow) the counters reset
-    without sending any command, so brief noise causes no action.
+    Empty slot → bright frame (sees ceiling).
+    Car parked → dark frame (car belly blocks light).
+    All logic runs in Python — ESP32 is a dumb actuator.
     """
 
     class State(Enum):
         EMPTY          = "EMPTY"
-        CONFIRMING_IN  = "CONFIRMING_IN"   # seeing dark, not yet sure
+        CONFIRMING_IN  = "CONFIRMING_IN"
         OCCUPIED       = "OCCUPIED"
-        CONFIRMING_OUT = "CONFIRMING_OUT"  # seeing bright, not yet sure
-        WAITING_CLEAR  = "WAITING_CLEAR"   # confirmed bright, delay before /clear
+        CONFIRMING_OUT = "CONFIRMING_OUT"
+        WAITING_CLEAR  = "WAITING_CLEAR"
 
     def __init__(self, label: str, gate: "GateController"):
-        self.label     = label
-        self._gate     = gate
-        self._state    = self.State.EMPTY
-        self._count    = 0          # confirm-in or confirm-out counter
-        self._gone_at  = 0.0       # time when WAITING_CLEAR started
-        self._lock     = threading.Lock()
+        self.label    = label
+        self._gate    = gate
+        self._state   = self.State.EMPTY
+        self._count   = 0
+        self._gone_at = 0.0
+        self._lock    = threading.Lock()
 
     @property
     def state(self) -> "SlotOccupancyDetector.State":
         with self._lock: return self._state
 
     def update(self, frame: np.ndarray):
-        """Call every processed frame.  Sends /car or /clear as needed."""
-        # Mean brightness of the whole frame (grayscale)
         gray       = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         brightness = float(np.mean(gray))
         is_dark    = brightness < SLOT_DARK_THRESHOLD
@@ -705,25 +663,19 @@ class SlotOccupancyDetector:
                               f"(brightness={brightness:.1f})")
                         log_event("slot_occupied", camera=self.label,
                                   brightness=round(brightness, 1))
-                        # Tell ESP32 a car is present — arm locks down
                         threading.Thread(target=self._gate._do, args=("car",),
                                          daemon=True).start()
             else:
                 with self._lock:
-                    self._count = 0   # reset on any bright frame
-
-        elif state == self.State.CONFIRMING_IN:
-            # This state is unused in the simplified two-step above but
-            # kept for future hysteresis tuning.
-            pass
+                    self._count = 0
 
         elif state == self.State.OCCUPIED:
             if not is_dark:
                 with self._lock:
                     self._count += 1
                     if self._count >= SLOT_CONFIRM_OUT:
-                        self._state  = self.State.WAITING_CLEAR
-                        self._count  = 0
+                        self._state   = self.State.WAITING_CLEAR
+                        self._count   = 0
                         self._gone_at = time.time()
                         print(f"  [{self.label}] SlotOccupancy → WAITING_CLEAR "
                               f"(brightness={brightness:.1f}, "
@@ -733,18 +685,16 @@ class SlotOccupancyDetector:
                                   delay_s=SLOT_CAR_GONE_DELAY_S)
             else:
                 with self._lock:
-                    self._count = 0   # car still there
+                    self._count = 0
 
         elif state == self.State.WAITING_CLEAR:
             if is_dark:
-                # Car came back during the delay — abort clear
                 with self._lock:
                     self._state = self.State.OCCUPIED
                     self._count = 0
-                print(f"  [{self.label}] SlotOccupancy → car returned, back to OCCUPIED")
+                print(f"  [{self.label}] SlotOccupancy → car returned, OCCUPIED")
                 log_event("slot_reoccupied", camera=self.label,
                           brightness=round(brightness, 1))
-                # Reaffirm to ESP32
                 threading.Thread(target=self._gate._do, args=("car",),
                                  daemon=True).start()
             else:
@@ -757,22 +707,18 @@ class SlotOccupancyDetector:
                           f"(waited {elapsed:.0f}s)")
                     log_event("slot_empty", camera=self.label,
                               waited_s=round(elapsed, 1))
-                    # Tell ESP32 the car is gone — arm may rise
                     threading.Thread(target=self._gate._do, args=("clear",),
                                      daemon=True).start()
 
     def overlay_text(self) -> str:
-        """Short string for the video overlay."""
-        with self._lock:
-            s = self._state
-        labels = {
-            self.State.EMPTY:          "slot: EMPTY",
-            self.State.CONFIRMING_IN:  "slot: arriving...",
-            self.State.OCCUPIED:       "slot: OCCUPIED",
-            self.State.CONFIRMING_OUT: "slot: leaving...",
-            self.State.WAITING_CLEAR:  "slot: confirming clear",
-        }
-        return labels.get(s, "slot: ?")
+        with self._lock: s = self._state
+        return {
+            self.State.EMPTY:         "slot: EMPTY",
+            self.State.CONFIRMING_IN: "slot: arriving...",
+            self.State.OCCUPIED:      "slot: OCCUPIED",
+            self.State.CONFIRMING_OUT:"slot: leaving...",
+            self.State.WAITING_CLEAR: "slot: confirming clear",
+        }.get(s, "slot: ?")
 
     def reset(self):
         with self._lock:
@@ -804,15 +750,6 @@ class GateState(Enum):
 
 
 class GateController:
-    """HTTP gate controller with full thread safety.
-
-    [ENH-1]  record_gate_open() called only after HTTP open succeeds.
-    [ENH-2]  _last_det seeded with time.time() — no bogus linger-loop exit.
-    [ENH-3]  is_dark property for safe external access.
-    [ENH-4]  update_car/update_light read state under lock.
-    [ENH-5]  HTTP failure path fully releases the internal lock.
-    """
-
     def __init__(self, gate_ip: str, label: str,
                  park_mon: ParkingMonitor, registry: GlobalPlateRegistry,
                  device_type: str = "gate",
@@ -829,13 +766,11 @@ class GateController:
         self._lu         = 0.0
         self._plate      = ""
         self._timer: Optional[threading.Timer] = None
-        self._last_det   = time.time()   # [ENH-2] seeded to now
+        self._last_det   = time.time()
         self._car        = False
         self._dark       = False
         self._car_ts     = 0.0
         self._light_ts   = 0.0
-
-    # ── Properties ──────────────────────────────────────────────────────
 
     @property
     def state(self) -> GateState:
@@ -846,13 +781,10 @@ class GateController:
 
     @property
     def is_dark(self) -> bool:
-        """[ENH-3] Thread-safe low-light state read."""
         with self._mu: return self._dark
 
     def get_open_plate(self) -> str:
         with self._mu: return self._plate if self._locked else ""
-
-    # ── Open / close ────────────────────────────────────────────────────
 
     def acquire_and_open(self, plate: str,
                          frame: Optional[np.ndarray] = None) -> bool:
@@ -876,19 +808,15 @@ class GateController:
             self._timer.start()
             log_event("gate_acquired", camera=self.label, plate=plate)
 
-        # HTTP open (lock released)
         opened = self._do("open")
 
         if opened:
-            # [ENH-5] Stamp cooldown + notify parking monitor only on success
             self._reg.stamp_cooldown(normalize_plate_text(plate))
             log_event("gate_opened", camera=self.label, plate=plate,
                       device_type=self.device_type)
-            # [ENH-1] record_gate_open AFTER confirmed open
             if self._pm and frame is not None:
                 self._pm.record_gate_open(frame)
         else:
-            # [ENH-5] Release internal lock on failure so next attempt works
             log_event("gate_open_failed", camera=self.label, plate=plate)
             with self._mu:
                 if self._timer:
@@ -905,7 +833,6 @@ class GateController:
         self._last_det = time.time()
 
     def _auto_release(self):
-        """Auto-close after open_dur, with capped linger for active detection."""
         linger_start = time.time()
         while time.time() - self._last_det < DETECTION_LINGER:
             if time.time() - linger_start > MAX_LINGER_CAP_S:
@@ -931,7 +858,7 @@ class GateController:
         plate = ""
         with self._mu:
             if not self._locked:
-                return           # already idle — nothing to close
+                return
             if self._timer: self._timer.cancel(); self._timer = None
             self._state = GateState.CLOSING
             plate = self._plate
@@ -960,8 +887,6 @@ class GateController:
     def send_keep(self) -> bool:
         return self._do("keep")
 
-    # ── HTTP ────────────────────────────────────────────────────────────
-
     def _do(self, ep: str) -> bool:
         url = f"{self.gate_ip}/{ep}"
         for i in range(1, GATE_RETRY_COUNT + 1):
@@ -975,10 +900,7 @@ class GateController:
                 time.sleep(GATE_RETRY_DELAY)
         return False
 
-    # ── Presence / light ────────────────────────────────────────────────
-
     def update_car(self, present: bool):
-        """[ENH-4] Read and write _car under lock before spawning thread."""
         if time.time() - self._car_ts < CAR_CHECK_INTERVAL:
             return
         with self._mu:
@@ -991,12 +913,6 @@ class GateController:
         self._car_ts = time.time()
 
     def update_light(self, dark: bool):
-        """[ENH-4] Read and write _dark under lock before spawning thread.
-
-        For gate-type devices, /dark triggers doOpen() on the ESP32.
-        That behaviour is only wanted when DARK_OPEN_GATE is True.
-        For slot-type devices, /dark only turns on the flash — always safe to send.
-        """
         if time.time() - self._light_ts < LOW_LIGHT_CHECK_INTERVAL:
             return
         with self._mu:
@@ -1004,8 +920,6 @@ class GateController:
             self._dark = dark
         if changed:
             if dark:
-                # Only send /dark to gate-type when DARK_OPEN_GATE allows it.
-                # Always send to slot-type (flash only, no servo movement).
                 if self.device_type == "slot" or DARK_OPEN_GATE:
                     threading.Thread(target=self._do, args=("dark",),
                                      daemon=True).start()
@@ -1013,8 +927,6 @@ class GateController:
                 threading.Thread(target=self._do, args=("light",),
                                  daemon=True).start()
         self._light_ts = time.time()
-
-    # ── Display ─────────────────────────────────────────────────────────
 
     def overlay_label(self) -> Tuple[str, tuple]:
         with self._mu:
@@ -1033,11 +945,6 @@ class GateController:
 # ══════════════════════════════════════════════════════════════════════════
 
 def _keep_alive_loop(workers: list):
-    """Send /keep to every open gate every KEEP_ALIVE_INTERVAL_S.
-
-    Critical for slot-type ESP32-CAM devices (130s watchdog).
-    Gate-type devices also accept /keep (resets their auto-close timer).
-    """
     while True:
         time.sleep(KEEP_ALIVE_INTERVAL_S)
         for w in workers:
@@ -1099,7 +1006,6 @@ def _publish(payload: dict):
         except Exception as e: print(f"RabbitMQ: {e}")
 
 
-# Debug save counter — initialised from existing files at section 15
 _dbg_n    = 0
 _dbg_lock = threading.Lock()
 
@@ -1115,7 +1021,6 @@ def save_debug(tag: str, raw: np.ndarray, prep: np.ndarray):
         _dbg_n += 1
 
 
-# ── ROI helper ────────────────────────────────────────────────────────────
 _roi_clicks: Dict[str, list] = {}
 
 
@@ -1163,8 +1068,6 @@ class CameraWorker(threading.Thread):
                                        registry, device_type=device_type)
         self.stab_ctr = StableDetectionCounter()
 
-        # Slot occupancy detector — only active for upward-facing slot cameras.
-        # Gate-type cameras face forward and use YOLO plate detection instead.
         self.slot_detector: Optional[SlotOccupancyDetector] = (
             SlotOccupancyDetector(label, self.gate)
             if device_type == "slot" else None
@@ -1176,6 +1079,8 @@ class CameraWorker(threading.Thread):
         self._hist_buf:  Dict[int, deque]                = {}
         self._last_det   = deque(maxlen=CAR_ABSENT_FRAMES)
         self._fc         = 0
+        # [FIX-D] per-track frame counter for LLM trigger throttle
+        self._no_vote_frames: Dict[int, int]             = {}
 
         registry.register_open_callback(label, self._open_gate_cb)
 
@@ -1245,12 +1150,13 @@ class CameraWorker(threading.Thread):
                 if t and t not in seen: h.append(t); seen.add(t)
 
     def _cleanup(self, tid: int):
-        for d in (self._voters, self._stability, self._hist_buf):
+        for d in (self._voters, self._stability, self._hist_buf,
+                  self._no_vote_frames):
             d.pop(tid, None)
         self.stab_ctr.clear(tid)
         self.llm.invalidate_track(tid)
 
-    # ── Submit to registry ───────────────────────────────────────────────
+    # ── Submit to registry  [FIX-B] ─────────────────────────────────────
 
     def _submit(self, frame: np.ndarray,
                 plate: str, ocr_conf: float, yolo_conf: float,
@@ -1266,6 +1172,17 @@ class CameraWorker(threading.Thread):
             return
 
         score = composite_score(yolo_conf, ocr_conf, correction_score)
+
+        # [FIX-B] FINAL_ACCEPT_THRESHOLD — single hard gate before registry
+        if score < FINAL_ACCEPT_THRESHOLD:
+            log_event("score_below_threshold", camera=self.label,
+                      plate=plate, score=round(score, 3),
+                      threshold=FINAL_ACCEPT_THRESHOLD)
+            print(f"  [{self.label}] {plate} score={score:.3f} "
+                  f"< threshold={FINAL_ACCEPT_THRESHOLD} — dropped")
+            cv2.rectangle(frame, (x1,y1),(x2,y2),(80,80,80),1)
+            return
+
         cand  = PlateCandidate(
             cam_id=self.label, plate=plate, score=score,
             yolo_conf=yolo_conf, ocr_conf=ocr_conf,
@@ -1304,7 +1221,6 @@ class CameraWorker(threading.Thread):
             cv2.setMouseCallback(win, _roi_mouse_cb, self.label)
 
         while not self._stop.is_set():
-            # ── Stream connect / reconnect  [ENH-7] ──────────────────────
             if cap is None or not cap.isOpened():
                 cap = cv2.VideoCapture(self.cam_url)
                 if not cap.isOpened():
@@ -1314,7 +1230,7 @@ class CameraWorker(threading.Thread):
                     time.sleep(retry_delay)
                     retry_delay = min(retry_delay * 2, STREAM_MAX_RETRY_DELAY)
                     continue
-                retry_delay = STREAM_RETRY_DELAY   # reset on success
+                retry_delay = STREAM_RETRY_DELAY
                 print(f"[{self.label}] Stream connected.")
 
             ret, frame = cap.read()
@@ -1326,21 +1242,15 @@ class CameraWorker(threading.Thread):
 
             self._fc += 1
 
-            # Parking monitor
             if self.park_mon.update(frame) and not self.gate.is_idle():
                 self.gate.close_now("park_monitor")
 
-            # Low-light  [ENH-3] use property, not direct _dark access
             dark = detect_low_light(frame, self.gate.is_dark)
             self.gate.update_light(dark)
 
-            # Slot occupancy (upward-facing camera) — runs every frame,
-            # before the FRAME_SKIP gate, so detection is as fast as possible.
-            # This replaces update_car() for slot-type cameras entirely.
             if self.slot_detector is not None:
                 self.slot_detector.update(frame)
 
-            # ROI overlay
             roi = CAMERA_ROI.get(self.label)
             if roi:
                 cv2.rectangle(frame, (roi[0],roi[1]),(roi[2],roi[3]),
@@ -1365,7 +1275,6 @@ class CameraWorker(threading.Thread):
                             cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0,100,255), 1,
                             cv2.LINE_AA)
 
-            # Frame skip
             if self._fc % FRAME_SKIP != 0:
                 self._slot[0] = frame.copy()
                 if SHOW_ROI_HELPER and win: cv2.imshow(win, frame)
@@ -1392,15 +1301,10 @@ class CameraWorker(threading.Thread):
                 confs.append(yc)
 
             self._last_det.append(len(boxes) > 0)
-            # Gate-type cameras: drive car-presence from YOLO plate detection.
-            # Slot-type cameras: slot_detector handles /car and /clear directly
-            # from frame brightness — do not call update_car() here.
             if self.slot_detector is None:
                 self.gate.update_car(any(self._last_det))
 
             assigns = self._tracker.update(boxes)
-
-            # [ENH-6] Safe yolo-conf lookup by index, not list.index()
             box_conf: Dict[Tuple, float] = dict(zip(boxes, confs))
 
             for tid, box in assigns:
@@ -1423,20 +1327,23 @@ class CameraWorker(threading.Thread):
                                        cy-(lb[1]+lb[3])/2)
                     if drift < OCR_SKIP_DRIFT:
                         cv2.rectangle(frame,(x1,y1b),(x2,y2b),(0,165,255),1)
-                        lr = self.llm.query(tid, list(self._hist(tid)),
-                                            voter._consonant_candidates)
-                        if lr and is_valid_plate(lr[0]):
-                            pt, lc = lr
-                            self.stab_ctr.record(tid, pt)
-                            if self.stab_ctr.ready(tid, pt):
-                                pv = self._tracker.get_province_cache(tid)
-                                if pv is False: pv = None
-                                voter.reset(); stab.reset()
-                                self._tracker.reset_track(tid)
-                                self._cleanup(tid)
-                                self._submit(frame, pt, lc, yolo_conf, 0.0,
-                                             pv, "llm_fallback",
-                                             x1, y1b, x2, y2b)
+                        # [FIX-D] Only query LLM after enough failed frames
+                        nvf = self._no_vote_frames.get(tid, 0)
+                        if nvf >= MIN_LLM_TRIGGER_FRAMES:
+                            lr = self.llm.query(tid, list(self._hist(tid)),
+                                                voter._consonant_candidates)
+                            if lr and is_valid_plate(lr[0]):
+                                pt, lc = lr
+                                self.stab_ctr.record(tid, pt)
+                                if self.stab_ctr.ready(tid, pt):
+                                    pv = self._tracker.get_province_cache(tid)
+                                    if pv is False: pv = None
+                                    voter.reset(); stab.reset()
+                                    self._tracker.reset_track(tid)
+                                    self._cleanup(tid)
+                                    self._submit(frame, pt, lc, yolo_conf, 0.0,
+                                                 pv, "llm_fallback",
+                                                 x1, y1b, x2, y2b)
                         continue
 
                 self._tracker.set_last_ocr_box(tid, box)
@@ -1452,8 +1359,13 @@ class CameraWorker(threading.Thread):
 
                 with self._ocr_sem:
                     ep = run_easyocr(self.reader, prep)
-                    er = run_easyocr_raw(self.reader, crop)
-                    ts = run_tesseract(prep)
+                    # [FIX-C] Fast mode skips raw multi-scale + Tesseract
+                    if FAST_MODE:
+                        er = []
+                        ts = []
+                    else:
+                        er = run_easyocr_raw(self.reader, crop)
+                        ts = run_tesseract(prep)
 
                 self._add_hist(tid, ep + er + ts)
 
@@ -1464,7 +1376,17 @@ class CameraWorker(threading.Thread):
 
                 print(f"  [{self.label} #{tid}] "
                       f"easy={[(r[1],round(float(r[2]),2)) for r in ep]}"
-                      f"  gate={ocr_min:.2f} pass={len(fused)}")
+                      f"  gate={ocr_min:.2f} pass={len(fused)}"
+                      + (" [FAST]" if FAST_MODE else ""))
+
+                # [FIX-D] Explicit fail-safe: if OCR produced nothing, log and skip cleanly
+                if not fused:
+                    log_event("ocr_empty", camera=self.label, track=tid,
+                              yolo=round(yolo_conf, 3))
+                    # Increment no-vote counter so LLM can eventually be tried
+                    self._no_vote_frames[tid] = self._no_vote_frames.get(tid, 0) + 1
+                    cv2.rectangle(frame,(x1,y1b),(x2,y2b),(0,165,255),1)
+                    continue   # ← explicit safe do-nothing, not silent fall-through
 
                 # Province (cached per track)
                 pc = self._tracker.get_province_cache(tid)
@@ -1488,8 +1410,10 @@ class CameraWorker(threading.Thread):
 
                 if winner_vote is not None:
                     plate_text, ocr_conf = winner_vote
-                    if not is_valid_plate(plate_text): continue
+                    if not is_valid_plate(plate_text):
+                        continue
 
+                    self._no_vote_frames[tid] = 0   # reset on successful vote
                     self.stab_ctr.record(tid, plate_text)
                     cnt = self.stab_ctr.count(tid, plate_text)
                     print(f"  [{self.label} #{tid}] "
@@ -1516,22 +1440,37 @@ class CameraWorker(threading.Thread):
                                  x1, y1b, x2, y2b)
 
                 else:
-                    lr = self.llm.query(tid, list(self._hist(tid)),
-                                        voter._consonant_candidates)
-                    if lr and is_valid_plate(lr[0]):
-                        pt, lc = lr
-                        self.stab_ctr.record(tid, pt)
-                        if self.stab_ctr.ready(tid, pt):
-                            pv = self._tracker.get_province_cache(tid)
-                            if pv is False: pv = None
-                            voter.reset(); stab.reset()
-                            self._tracker.reset_track(tid)
-                            self._cleanup(tid)
-                            self._submit(frame, pt, lc, yolo_conf, 0.0,
-                                         pv, "llm_fallback",
-                                         x1, y1b, x2, y2b)
+                    # [FIX-D] Increment no-vote counter; LLM triggered only after threshold
+                    self._no_vote_frames[tid] = self._no_vote_frames.get(tid, 0) + 1
+                    nvf = self._no_vote_frames[tid]
+
+                    if nvf >= MIN_LLM_TRIGGER_FRAMES:
+                        lr = self.llm.query(tid, list(self._hist(tid)),
+                                            voter._consonant_candidates)
+                        if lr and is_valid_plate(lr[0]):
+                            pt, lc = lr
+                            self.stab_ctr.record(tid, pt)
+                            if self.stab_ctr.ready(tid, pt):
+                                pv = self._tracker.get_province_cache(tid)
+                                if pv is False: pv = None
+                                voter.reset(); stab.reset()
+                                self._tracker.reset_track(tid)
+                                self._cleanup(tid)
+                                self._submit(frame, pt, lc, yolo_conf, 0.0,
+                                             pv, "llm_fallback",
+                                             x1, y1b, x2, y2b)
+                            else:
+                                cv2.rectangle(frame,(x1,y1b),(x2,y2b),(0,165,255),2)
+                        else:
+                            cv2.rectangle(frame,(x1,y1b),(x2,y2b),(0,165,255),2)
                     else:
+                        # [FIX-D] Not enough frames yet — safe do-nothing
                         cv2.rectangle(frame,(x1,y1b),(x2,y2b),(0,165,255),2)
+                        cv2.putText(frame,
+                                    f"#{tid} voting… ({nvf}/{MIN_LLM_TRIGGER_FRAMES})",
+                                    (x1, max(y1b-5,0)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.35,
+                                    (0,165,255), 1)
 
             self._slot[0] = frame.copy()
             if SHOW_ROI_HELPER and win: cv2.imshow(win, frame)
@@ -1550,8 +1489,7 @@ class CameraWorker(threading.Thread):
 # 17. INITIALISATION & DISPLAY LOOP
 # ══════════════════════════════════════════════════════════════════════════
 
-# [FIX-6] Count existing debug files so new saves always work this session
-_dbg_n = len(glob.glob("debug_*_raw.jpg"))  # matches debug_{ts}_{tag}_raw.jpg
+_dbg_n = len(glob.glob("debug_*_raw.jpg"))
 
 reload_allowed_plates()
 
@@ -1570,8 +1508,8 @@ model      = YOLO(model_path)
 print("Initialising LLM fallback…")
 llm = LLMCorrector()
 
-registry   = GlobalPlateRegistry()
-ocr_sem    = threading.Semaphore(1)  # EasyOCR reader is not thread-safe; serialize all OCR calls
+registry    = GlobalPlateRegistry()
+ocr_sem     = threading.Semaphore(1)
 frame_slots = [[np.zeros((360, 640, 3), dtype=np.uint8)] for _ in CAMERAS]
 
 workers: List[CameraWorker] = []
@@ -1591,8 +1529,7 @@ for w in workers:
 threading.Thread(target=_keep_alive_loop, args=(workers,),
                  daemon=True, name="keep-alive").start()
 
-# ── Startup banner  [ENH-8] ──────────────────────────────────────────────
-print(f"\n🅿️  Smart Parking ALPR v15.3  ({len(CAMERAS)} cameras)")
+print(f"\n🅿️  Smart Parking ALPR v15.4  ({len(CAMERAS)} cameras)")
 cam_types = {}
 for cam_cfg in CAMERAS:
     cam_url, gate_ip, flip, label = cam_cfg[0], cam_cfg[1], cam_cfg[2], cam_cfg[3]
@@ -1604,6 +1541,9 @@ for cam_cfg in CAMERAS:
           f"  ROI={roi}"
           f"  arrive={thr.get('movement_frac')}"
           f"  exit={thr.get('exit_frac')}")
+print(f"   Final accept threshold  : {FINAL_ACCEPT_THRESHOLD}")
+print(f"   LLM trigger frames      : {MIN_LLM_TRIGGER_FRAMES}")
+print(f"   Fast mode               : {FAST_MODE}")
 print(f"   Best-Camera-Wins window : {CLAIM_WINDOW_SEC}s")
 print(f"   Stable gate             : {REQUIRED_STABLE_DETECTIONS} confirmations")
 print(f"   Linger cap              : {MAX_LINGER_CAP_S}s")
@@ -1617,12 +1557,14 @@ print("   Press Q to quit.\n")
 log_event("system_start",
           cameras=[c[3] for c in CAMERAS],
           device_types=cam_types,
+          final_accept_threshold=FINAL_ACCEPT_THRESHOLD,
+          llm_trigger_frames=MIN_LLM_TRIGGER_FRAMES,
+          fast_mode=FAST_MODE,
           claim_window=CLAIM_WINDOW_SEC,
           stable_req=REQUIRED_STABLE_DETECTIONS,
           linger_cap=MAX_LINGER_CAP_S,
           keep_alive_s=KEEP_ALIVE_INTERVAL_S)
 
-# ── Display loop ──────────────────────────────────────────────────────────
 while True:
     panels = []
     for slot in frame_slots:
@@ -1650,11 +1592,10 @@ while True:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0,255,255), 1,
                     cv2.LINE_AA)
 
-    cv2.imshow("Smart Parking ALPR v15.3", combined)
+    cv2.imshow("Smart Parking ALPR v15.4", combined)
     if cv2.waitKey(1) & 0xFF == ord("q"):
         break
 
-# ── Shutdown ──────────────────────────────────────────────────────────────
 print("\nShutting down…")
 log_event("system_stop")
 for w in workers: w.stop()
