@@ -1,16 +1,45 @@
 """
-main.py — Smart Parking Gate ALPR  v15.1
+main.py — Smart Parking Gate ALPR  v15.3
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Fixes from v15.0:
-  [BUG-1]  plate = winner.plate  (was wrongly winner.cam_id)
-  [BUG-2]  _on_registry_win removed — _wire_registry_callbacks is the
-           single clean path; no dead/stub code remains.
+Enhancements over v15.2
+═══════════════════════
+  [ENH-1]  GateController.acquire_and_open() now calls record_gate_open()
+           AFTER the HTTP open succeeds, so ParkingMonitor never enters
+           WAITING state when the gate hardware failed to open.
 
-Features (unchanged from v15.0):
-  [FIX-1]  Best-Camera-Wins challenge window (CLAIM_WINDOW_SEC)
-  [FIX-2]  ROI-masked motion + blob filter (waving trees / rain)
-  [FIX-3]  TrackedLock + DeadlockWatchdog + strict lock-ordering
+  [ENH-2]  GateController._last_det initialised to time.time() instead of
+           0.0, so the linger check is correct from the very first call.
+
+  [ENH-3]  GateController now exposes an is_dark property (thread-safe)
+           so _run_inner never accesses _dark directly without the lock.
+
+  [ENH-4]  update_car() / update_light() read self._car / self._dark under
+           the lock before spawning the background thread, eliminating a
+           potential race between the read and the write.
+
+  [ENH-5]  acquire_and_open() fully releases the internal lock (cancels
+           timer, clears _locked/_plate) if the HTTP open call fails, so
+           the gate is never stuck until MAX_LOCK_TIME on a network error.
+
+  [ENH-6]  _yc() closure in _run_inner replaced with a proper index lookup
+           that handles duplicate boxes safely.
+
+  [ENH-7]  Stream reconnect now has exponential back-off (up to 16s) to
+           avoid hammering an unavailable camera IP.
+
+  [ENH-8]  System-start log event now includes all camera device types.
+
+Bug fixes carried from v15.2
+═════════════════════════════
+  device_type field in CAMERAS config (server controls all logic)
+  Cooldown stamped after successful HTTP only
+  Linger loop capped at MAX_LINGER_CAP_S
+  /keep heartbeat thread for ESP32-CAM watchdog
+  Whitelist auto-refresh thread
+  _dbg_n initialised from existing file count
+  _car/_dark reads under lock (update_car/update_light)
+  overlay_label reads _dark under lock
 """
 
 import cv2
@@ -59,66 +88,54 @@ from llm_plate_corrector import LLMCorrector
 # ══════════════════════════════════════════════════════════════════════════
 
 # ── Cameras & Gates ───────────────────────────────────────────────────────
-# (stream_url, gate_ip, flip_code, label)
-CAMERAS: List[Tuple[str, str, Optional[int], str]] = [
-    ("http://172.20.10.4:81/stream", "http://172.20.10.6", 1, "CAM-1"),
-    ("http://172.20.10.5:81/stream", "http://172.20.10.7", 1, "CAM-2"),
+# Tuple: (stream_url, gate_ip, flip_code, label, device_type)
+#
+# device_type:
+#   "gate"  → esp32_motor_controller.ino
+#             POST /open  = sweep 0→90° (barrier UP)
+#             POST /close = sweep 90→0° + detach
+#
+#   "slot"  → esp32cam_parking_lock.ino
+#             POST /open  = servo 0° (slot open)
+#             POST /close = servo 90° (slot blocked)
+#             Requires /keep heartbeat every ~60s while open.
+CAMERAS: List[Tuple[str, str, Optional[int], str, str]] = [
+    ("http://172.20.10.4:81/stream", "http://172.20.10.6", 1, "CAM-1", "gate"),
+    ("http://172.20.10.5:81/stream", "http://172.20.10.7", 1, "CAM-2", "gate"),
 ]
 
-# ── [FIX-2] Per-camera parking spot ROI ──────────────────────────────────
-# Pixel rectangle (x1, y1, x2, y2) of the actual parking spot.
-# Frame-diff is computed ONLY inside this box — trees / shadows outside
-# the box cannot trigger anything.
-# Set to None to use the full frame (less precise, easier to start).
-#
-# To find coordinates: set SHOW_ROI_HELPER = True, run, click two corners
-# in each camera window, copy the printed values here, set back to False.
 SHOW_ROI_HELPER = False
 
 CAMERA_ROI: Dict[str, Optional[Tuple[int, int, int, int]]] = {
-    "CAM-1": None,   # e.g. (120, 80, 520, 400)
+    "CAM-1": None,
     "CAM-2": None,
 }
 
-# ── [FIX-2] Per-camera motion thresholds ─────────────────────────────────
-# movement_frac : fraction of ROI pixels that must change → car ARRIVED
-# exit_frac     : fraction of ROI pixels that must change → car LEFT
-# Increase for windy / outdoor / tree cameras.  Decrease for indoor.
 CAMERA_MOTION: Dict[str, dict] = {
     "CAM-1": {"movement_frac": 0.04, "exit_frac": 0.06},
     "CAM-2": {"movement_frac": 0.04, "exit_frac": 0.06},
 }
 
-# ── [FIX-2] Blob filter ───────────────────────────────────────────────────
-# Ignore changed-pixel blobs smaller than this fraction of ROI area.
-# Kills raindrops, insects, single-pixel noise.
-MIN_BLOB_AREA_FRAC = 0.005   # 0.5 % of ROI
+MIN_BLOB_AREA_FRAC   = 0.005
+CLAIM_WINDOW_SEC     = 1.5
+ALLOW_ALL_PLATES     = False
+ALLOWED_PLATES: set  = set()
+ALLOWED_PLATES_DB    = "allowed_plates.db"
 
-# ── [FIX-1] Best-Camera-Wins challenge window ─────────────────────────────
-# All cameras have this many seconds to submit their scored bid.
-# After the window the highest composite score wins.
-CLAIM_WINDOW_SEC = 1.5
-
-# ── Access control ────────────────────────────────────────────────────────
-ALLOW_ALL_PLATES = False   # NEVER True in production
-
-ALLOWED_PLATES: set = {
-    # "กข1234",
-    # "3กบ7744",
-}
-ALLOWED_PLATES_DB = "allowed_plates.db"   # "" to disable
+# How often to reload the SQLite whitelist at runtime
+PLATES_REFRESH_INTERVAL_S = 60
 
 # ── Detection ─────────────────────────────────────────────────────────────
-COOLDOWN_TIME       = 15
-FRAME_SKIP          = 3
-YOLO_CONF_THRESHOLD = 0.35
-STREAM_RETRY_DELAY  = 2
+COOLDOWN_TIME        = 15
+FRAME_SKIP           = 3
+YOLO_CONF_THRESHOLD  = 0.35
+STREAM_RETRY_DELAY   = 2
+STREAM_MAX_RETRY_DELAY = 16   # [ENH-7] exponential back-off cap
 
-# ── OCR confidence gate ───────────────────────────────────────────────────
-BASE_OCR_CONF  = 0.40
-ADAPTIVE_SCALE = 0.20
+# ── OCR confidence ────────────────────────────────────────────────────────
+BASE_OCR_CONF        = 0.40
+ADAPTIVE_SCALE       = 0.20
 
-# ── Stable-detection gate ─────────────────────────────────────────────────
 REQUIRED_STABLE_DETECTIONS = 3
 
 # ── OCR pipeline ─────────────────────────────────────────────────────────
@@ -132,44 +149,71 @@ MAX_CORRECTION_SCORE  = 0.65
 LLM_CANDIDATE_HISTORY = 20
 
 # ── Gate timing ───────────────────────────────────────────────────────────
-GATE_OPEN_DURATION = 120.0
-GATE_HTTP_TIMEOUT  = 3.0
-GATE_RETRY_COUNT   = 3
-GATE_RETRY_DELAY   = 0.5
-MAX_LOCK_TIME      = GATE_OPEN_DURATION + 10.0
-DETECTION_LINGER   = 3.0
+GATE_OPEN_DURATION   = 120.0
+GATE_HTTP_TIMEOUT    = 3.0
+GATE_RETRY_COUNT     = 3
+GATE_RETRY_DELAY     = 0.5
+MAX_LOCK_TIME        = GATE_OPEN_DURATION + 10.0
+DETECTION_LINGER     = 3.0
+MAX_LINGER_CAP_S     = 30.0   # hard cap on linger extension
+KEEP_ALIVE_INTERVAL_S = 60.0  # heartbeat to ESP32-CAM
 
-# ── Low-light ────────────────────────────────────────────────────────────
+# ── Low-light ─────────────────────────────────────────────────────────────
 LOW_LIGHT_THRESHOLD      = 55
 LOW_LIGHT_HYSTERESIS     = 70
 LOW_LIGHT_CHECK_INTERVAL = 5.0
-DARK_OPEN_GATE           = False   # gate never opens without a plate
+DARK_OPEN_GATE           = False
 
-# ── Car presence ──────────────────────────────────────────────────────────
-CAR_CHECK_INTERVAL = 2.0
-CAR_ABSENT_FRAMES  = 15
+# ── Car presence ─────────────────────────────────────────────────────────
+CAR_CHECK_INTERVAL   = 2.0
+CAR_ABSENT_FRAMES    = 15
 
-# ── Motion frame-diff ────────────────────────────────────────────────────
-MOVEMENT_BLUR_K       = 7     # must be odd
+# ── Slot occupancy detection (upward-facing camera) ───────────────────────
+# The under-car camera faces up. When a car parks over it the frame goes
+# dark because the car body blocks the light.
+#
+# SLOT_DARK_THRESHOLD  — mean pixel brightness (0-255) below which the
+#                        frame is considered "dark = car present".
+#                        Tune this for your lighting. Start at 60.
+#
+# SLOT_CONFIRM_IN      — consecutive dark frames needed to confirm car arrived.
+#                        At FRAME_SKIP=3, 5 frames ≈ 0.5s of video.
+#
+# SLOT_CONFIRM_OUT     — consecutive bright frames needed to confirm car left.
+#                        Higher = less likely to false-clear on a shadow.
+#                        At FRAME_SKIP=3, 20 frames ≈ 2s of video.
+#
+# SLOT_CAR_GONE_DELAY_S — extra seconds Python waits after confirming car left
+#                         before sending /clear to the ESP32. Matches the
+#                         firmware's 60-second confirmation window but is
+#                         controlled here on the server side.
+#
+SLOT_DARK_THRESHOLD   = 60    # mean brightness below this = car present
+SLOT_CONFIRM_IN       = 5     # dark frames to confirm car arrived
+SLOT_CONFIRM_OUT      = 20    # bright frames to confirm car left
+SLOT_CAR_GONE_DELAY_S = 65.0  # seconds after brightness returns before /clear
+
+# ── Motion frame-diff ─────────────────────────────────────────────────────
+MOVEMENT_BLUR_K       = 7
 MOVEMENT_THRESH_PIX   = 30
 MOTION_CONFIRM_FRAMES = 3
 
 # ── Parking timing ────────────────────────────────────────────────────────
-PARK_CONFIRM_WAIT = 60.0
-MIN_PARK_SECONDS  = 10.0
+PARK_CONFIRM_WAIT    = 60.0
+MIN_PARK_SECONDS     = 10.0
 
 # ── YOLO model ────────────────────────────────────────────────────────────
 HF_REPO_ID        = "Rattatammanoon/hurricane-od-thai-plate-detector"
 HF_MODEL_FILENAME = "HurricaneOD_beta.pt"
 
-# ── [FIX-3] Lock debug ────────────────────────────────────────────────────
+# ── Lock debug ────────────────────────────────────────────────────────────
 LOG_LOCK_DEBUG     = False
 DEADLOCK_TIMEOUT_S = 5.0
 
 # ── Logging ───────────────────────────────────────────────────────────────
 EVENT_LOG_FILE = "parking_events.jsonl"
 
-# ── Debug ─────────────────────────────────────────────────────────────────
+# ── Debug crops ───────────────────────────────────────────────────────────
 DEBUG_SAVE_CROPS = False
 DEBUG_MAX_SAVES  = 10
 
@@ -183,12 +227,10 @@ PANEL_W = 640
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 2. INSTRUMENTED LOCK  [FIX-3]
+# 2. INSTRUMENTED LOCK
 # ══════════════════════════════════════════════════════════════════════════
 
 class TrackedLock:
-    """Lock that records holder + acquisition time for the deadlock watchdog."""
-
     def __init__(self, name: str):
         self._name    = name
         self._lock    = threading.Lock()
@@ -205,17 +247,12 @@ class TrackedLock:
             with self._meta:
                 self._held_by = caller
                 self._held_at = time.monotonic()
-            if LOG_LOCK_DEBUG:
-                print(f"  [LOCK] {caller} ✓ HELD {self._name}")
         return result
 
     def release(self):
         with self._meta:
             self._held_by = None
             self._held_at = 0.0
-        if LOG_LOCK_DEBUG:
-            print(f"  [LOCK] {threading.current_thread().name}"
-                  f" ↑ RELEASE {self._name}")
         self._lock.release()
 
     def __enter__(self):  self.acquire(); return self
@@ -230,7 +267,7 @@ class TrackedLock:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 3. DEADLOCK WATCHDOG  [FIX-3]
+# 3. DEADLOCK WATCHDOG
 # ══════════════════════════════════════════════════════════════════════════
 
 _tracked_locks: List[TrackedLock] = []
@@ -249,9 +286,8 @@ def _deadlock_watchdog():
         for lk in locks:
             dur = lk.held_duration()
             if dur > DEADLOCK_TIMEOUT_S:
-                msg = (f"⚠️  [WATCHDOG] Lock '{lk._name}' held by "
-                       f"'{lk.holder()}' for {dur:.1f}s")
-                print(msg)
+                print(f"⚠️  [WATCHDOG] Lock '{lk._name}' held by "
+                      f"'{lk.holder()}' for {dur:.1f}s")
                 log_event("deadlock_warning", lock=lk._name,
                           holder=lk.holder(), duration=round(dur, 1))
 
@@ -305,6 +341,15 @@ def reload_allowed_plates():
     print(f"  [Access] Whitelist: {len(_allowed_cache)} plates")
 
 
+def _plates_refresh_loop():
+    while True:
+        time.sleep(PLATES_REFRESH_INTERVAL_S)
+        try:
+            reload_allowed_plates()
+        except Exception as e:
+            print(f"  [Access] Refresh error: {e}")
+
+
 def is_plate_allowed(plate: str) -> bool:
     if ALLOW_ALL_PLATES: return True
     norm = normalize_plate_text(plate)
@@ -316,23 +361,21 @@ def is_plate_allowed(plate: str) -> bool:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 6. PLATE CANDIDATE  (data class)
+# 6. PLATE CANDIDATE
 # ══════════════════════════════════════════════════════════════════════════
 
 class PlateCandidate:
-    """Everything a camera knows about a detected plate at claim time."""
-
     __slots__ = ("cam_id", "plate", "score", "yolo_conf", "ocr_conf",
                  "correction_score", "x1", "y1", "x2", "y2",
-                 "prov_info", "source", "frame")
+                 "prov_info", "source", "frame", "device_type")
 
     def __init__(self, cam_id: str, plate: str, score: float,
                  yolo_conf: float, ocr_conf: float, correction_score: float,
                  x1: int, y1: int, x2: int, y2: int,
                  prov_info: Optional[dict], source: str,
-                 frame: np.ndarray):
+                 frame: np.ndarray, device_type: str = "gate"):
         self.cam_id           = cam_id
-        self.plate            = plate            # ← actual plate string
+        self.plate            = plate
         self.score            = score
         self.yolo_conf        = yolo_conf
         self.ocr_conf         = ocr_conf
@@ -341,58 +384,43 @@ class PlateCandidate:
         self.x2, self.y2     = x2, y2
         self.prov_info        = prov_info
         self.source           = source
-        self.frame            = frame            # snapshot for drawing
+        self.frame            = frame
+        self.device_type      = device_type
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 7. GLOBAL PLATE REGISTRY — Best-Camera-Wins  [FIX-1]
+# 7. GLOBAL PLATE REGISTRY
 # ══════════════════════════════════════════════════════════════════════════
 
 class GlobalPlateRegistry:
-    """
-    [FIX-1] Best-Camera-Wins coordinator.
+    """Best-Camera-Wins coordinator.
 
-    Flow:
-      1. submit_claim(plate, candidate)
-           → starts a CLAIM_WINDOW_SEC timer (first submission only).
-           → subsequent cameras add their bid to the same window.
-      2. After the window, _resolve(plate) fires in a Timer thread:
-           → picks max(candidates, key=score)
-           → calls the winner's registered open-gate callback.
-           → lock is RELEASED before calling the callback [FIX-3].
-
-    [FIX-3] ONE TrackedLock guards all mutable state.
-            External callbacks (open_gate) are never called while locked.
+    Cooldown is stamped by GateController after a successful HTTP open,
+    not at resolve time, so network failures allow immediate retry.
     """
 
     def __init__(self):
-        self._lock = _register_lock(TrackedLock("Registry"))
-
-        # plate_norm → [PlateCandidate, ...]   (during challenge window)
+        self._lock     = _register_lock(TrackedLock("Registry"))
         self._pending:  Dict[str, List[PlateCandidate]] = {}
-        # plate_norm → {"cam_id": str, "ts": float}  (gate currently open)
         self._active:   Dict[str, dict] = {}
-        # plate_norm → timestamp of last fire  (global cooldown)
         self._cooldown: Dict[str, float] = {}
-        # plate_norm → threading.Timer
         self._timers:   Dict[str, threading.Timer] = {}
-        # cam_id → callable(PlateCandidate)
         self._open_cbs: Dict[str, callable] = {}
 
     def register_open_callback(self, cam_id: str, fn: callable):
         with self._lock:
             self._open_cbs[cam_id] = fn
 
+    def stamp_cooldown(self, plate_norm: str):
+        """Called by GateController after /open HTTP succeeds."""
+        with self._lock:
+            self._cooldown[plate_norm] = time.time()
+
     def submit_claim(self, candidate: PlateCandidate) -> bool:
-        """
-        Returns True if the bid was accepted.
-        Returns False if plate is in cooldown or the gate is already open.
-        """
         now  = time.time()
         norm = normalize_plate_text(candidate.plate)
 
         with self._lock:
-            # Global cooldown
             last = self._cooldown.get(norm, 0.0)
             if now - last < COOLDOWN_TIME:
                 rem = COOLDOWN_TIME - (now - last)
@@ -400,13 +428,11 @@ class GlobalPlateRegistry:
                       f"({candidate.cam_id})")
                 return False
 
-            # Gate already open for this plate
             if norm in self._active:
                 owner = self._active[norm]["cam_id"]
                 print(f"  [Registry] {norm} gate already open by {owner}")
                 return False
 
-            # Open challenge window on first bid
             if norm not in self._pending:
                 self._pending[norm] = []
                 t = threading.Timer(CLAIM_WINDOW_SEC,
@@ -414,7 +440,7 @@ class GlobalPlateRegistry:
                 t.daemon = True
                 t.start()
                 self._timers[norm] = t
-                print(f"  [Registry] {norm} challenge window opened "
+                print(f"  [Registry] {norm} challenge window "
                       f"({CLAIM_WINDOW_SEC}s)")
 
             self._pending[norm].append(candidate)
@@ -423,43 +449,38 @@ class GlobalPlateRegistry:
             return True
 
     def _resolve(self, norm: str):
-        """
-        Timer callback — runs in its own thread.
-        [FIX-3] Acquires lock → copies data → releases lock → calls callback.
-        No external code is ever called while the lock is held.
-        """
         with self._lock:
             candidates = self._pending.pop(norm, [])
             self._timers.pop(norm, None)
             if not candidates:
                 return
-
-            # Best score wins  [FIX-1]
             winner = max(candidates, key=lambda c: c.score)
+            self._active[norm] = {"cam_id": winner.cam_id, "ts": time.time()}
+            cb     = self._open_cbs.get(winner.cam_id)
+            losers = [c.cam_id for c in candidates
+                      if c.cam_id != winner.cam_id]
 
-            self._active[norm]   = {"cam_id": winner.cam_id, "ts": time.time()}
-            self._cooldown[norm] = time.time()
-
-            # Copy callback ref — must NOT call while locked
-            cb      = self._open_cbs.get(winner.cam_id)
-            losers  = [c.cam_id for c in candidates
-                       if c.cam_id != winner.cam_id]
-
-        # ── Lock released ─────────────────────────────────────────────────
         print(f"  [Registry] {norm} WINNER={winner.cam_id} "
               f"score={winner.score:.3f}  losers={losers}")
         log_event("plate_winner", plate=norm,
                   winner=winner.cam_id, score=round(winner.score, 4),
-                  losers=losers,
-                  yolo=round(winner.yolo_conf, 4),
+                  losers=losers, yolo=round(winner.yolo_conf, 4),
                   ocr=round(winner.ocr_conf, 4))
 
         if cb:
             try:
-                cb(winner)   # winner.plate is the real plate string [BUG-1 fixed]
+                cb(winner)
             except Exception as e:
-                print(f"  [Registry] callback error for {winner.cam_id}: {e}")
+                print(f"  [Registry] callback error {winner.cam_id}: {e}")
                 log_event("registry_cb_error", plate=norm, error=str(e))
+                # Clean up _active so the plate isn't stuck forever
+                with self._lock:
+                    self._active.pop(norm, None)
+        else:
+            # No callback registered for this camera — release immediately
+            print(f"  [Registry] {norm} no callback for {winner.cam_id} — releasing")
+            with self._lock:
+                self._active.pop(norm, None)
 
     def release(self, plate: str, cam_id: str):
         norm = normalize_plate_text(plate)
@@ -470,34 +491,28 @@ class GlobalPlateRegistry:
                 log_event("plate_released", plate=norm, camera=cam_id)
 
     def active_plates(self) -> dict:
-        with self._lock:
-            return dict(self._active)
+        with self._lock: return dict(self._active)
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 8. ROI-MASKED MOTION DETECTION  [FIX-2]
+# 8. ROI-MASKED MOTION DETECTION
 # ══════════════════════════════════════════════════════════════════════════
 
 def _frame_diff_frac(f1: np.ndarray, f2: np.ndarray,
                      roi: Optional[Tuple[int, int, int, int]]) -> float:
-    """
-    Blur + binary mask inside ROI only.
-    Blob filter removes components smaller than MIN_BLOB_AREA_FRAC of ROI.
-    """
     h, w = f1.shape[:2]
-
     if roi is not None:
         x1, y1, x2, y2 = roi
         x1, y1 = max(0, x1), max(0, y1)
         x2, y2 = min(w, x2), min(h, y2)
-        c1, c2 = f1[y1:y2, x1:x2], f2[y1:y2, x1:x2]
+        c1, c2   = f1[y1:y2, x1:x2], f2[y1:y2, x1:x2]
         roi_area = max((y2-y1) * (x2-x1), 1)
+        if c1.size == 0 or c2.size == 0:
+            print("  [Motion] ROI empty — check CAMERA_ROI config")
+            return 0.0
     else:
         c1, c2   = f1, f2
         roi_area = max(h * w, 1)
-
-    if c1.size == 0 or c2.size == 0:
-        return 0.0
 
     g1 = cv2.cvtColor(c1, cv2.COLOR_BGR2GRAY)
     g2 = cv2.cvtColor(c2, cv2.COLOR_BGR2GRAY)
@@ -505,12 +520,9 @@ def _frame_diff_frac(f1: np.ndarray, f2: np.ndarray,
     b2 = cv2.GaussianBlur(g2, (MOVEMENT_BLUR_K, MOVEMENT_BLUR_K), 0)
     _, mask = cv2.threshold(cv2.absdiff(b1, b2),
                             MOVEMENT_THRESH_PIX, 255, cv2.THRESH_BINARY)
-
-    # Morphological close: merge nearby changed pixels into blobs
     kern = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kern)
 
-    # Blob filter: remove small components (raindrops, insects)
     min_px = int(roi_area * MIN_BLOB_AREA_FRAC)
     if min_px > 0:
         n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
@@ -534,25 +546,25 @@ class ParkingMonitor:
         PARKED  = "PARKED"
         EXITING = "EXITING"
 
-    def __init__(self, label: str,
-                 movement_frac: float, exit_frac: float,
+    def __init__(self, label: str, movement_frac: float, exit_frac: float,
                  roi: Optional[Tuple[int, int, int, int]]):
-        self.label     = label
-        self._mov_frac = movement_frac
-        self._exit_frac= exit_frac
-        self._roi      = roi
-        self._phase    = self.Phase.IDLE
-        self._open_t   = 0.0
-        self._park_t   = 0.0
+        self.label      = label
+        self._mov_frac  = movement_frac
+        self._exit_frac = exit_frac
+        self._roi       = roi
+        self._phase     = self.Phase.IDLE
+        self._open_t    = 0.0
+        self._park_t    = 0.0
         self._ref: Optional[np.ndarray] = None
-        self._consec   = 0
-        self._lock     = _register_lock(TrackedLock(f"ParkMon-{label}"))
+        self._consec    = 0
+        self._lock      = _register_lock(TrackedLock(f"ParkMon-{label}"))
 
     @property
-    def phase(self):
+    def phase(self) -> "ParkingMonitor.Phase":
         with self._lock: return self._phase
 
     def record_gate_open(self, frame: np.ndarray):
+        """[ENH-1] Called AFTER the gate HTTP open succeeds."""
         with self._lock:
             self._phase  = self.Phase.WAITING
             self._open_t = time.time()
@@ -562,10 +574,9 @@ class ParkingMonitor:
         log_event("park_phase", camera=self.label, phase="WAITING")
 
     def update(self, frame: np.ndarray) -> bool:
-        """Returns True when gate should close."""
         with self._lock:
-            ph  = self._phase; ot = self._open_t; pt = self._park_t
-            ref = self._ref;   mf = self._mov_frac; ef = self._exit_frac
+            ph  = self._phase;  ot  = self._open_t;  pt = self._park_t
+            ref = self._ref;    mf  = self._mov_frac; ef = self._exit_frac
             roi = self._roi
 
         now  = time.time()
@@ -586,13 +597,11 @@ class ParkingMonitor:
                         self._park_t = now
                         self._ref    = frame.copy()
                         self._consec = 0
-                    print(f"  [{self.label} ParkMon] PARKED  diff={diff:.4f}")
                     log_event("park_phase", camera=self.label,
                               phase="PARKED", diff=round(diff, 4))
             else:
                 with self._lock: self._consec = 0
             if now - ot > PARK_CONFIRM_WAIT:
-                print(f"  [{self.label} ParkMon] TIMEOUT")
                 log_event("park_phase", camera=self.label, phase="TIMEOUT")
                 with self._lock:
                     self._phase  = self.Phase.IDLE
@@ -608,10 +617,8 @@ class ParkingMonitor:
                     with self._lock:
                         self._phase  = self.Phase.EXITING
                         self._consec = 0
-                    print(f"  [{self.label} ParkMon] EXITING  "
-                          f"diff={diff:.4f}  parked={now-pt:.1f}s")
-                    log_event("park_phase", camera=self.label, phase="EXITING",
-                              diff=round(diff, 4))
+                    log_event("park_phase", camera=self.label,
+                              phase="EXITING", diff=round(diff, 4))
             else:
                 with self._lock: self._consec = 0
             return False
@@ -633,7 +640,148 @@ class ParkingMonitor:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 10. STABLE-DETECTION COUNTER
+# 10. SLOT OCCUPANCY DETECTOR  (upward-facing camera)
+# ══════════════════════════════════════════════════════════════════════════
+
+class SlotOccupancyDetector:
+    """Detects whether a car is parked over the slot using frame brightness.
+
+    The camera is mounted face-up under the parking slot.  When no car is
+    present it sees the ceiling / open sky — a relatively bright scene.
+    When a car parks on top of the camera it blocks the light and the
+    entire frame becomes dark.
+
+    Logic (all controlled by Python — ESP32 is a dumb actuator):
+
+      EMPTY → dark frames arrive → CONFIRMING_IN (count up to SLOT_CONFIRM_IN)
+        → OCCUPIED  : sends POST /car  to ESP32
+
+      OCCUPIED → bright frames arrive → CONFIRMING_OUT (count up to SLOT_CONFIRM_OUT)
+        → wait SLOT_CAR_GONE_DELAY_S seconds  (belt-and-braces on top of
+          the firmware's own 60s timer so the arm never rises prematurely)
+        → EMPTY      : sends POST /clear to ESP32
+
+    If the brightness oscillates (intermittent shadow) the counters reset
+    without sending any command, so brief noise causes no action.
+    """
+
+    class State(Enum):
+        EMPTY          = "EMPTY"
+        CONFIRMING_IN  = "CONFIRMING_IN"   # seeing dark, not yet sure
+        OCCUPIED       = "OCCUPIED"
+        CONFIRMING_OUT = "CONFIRMING_OUT"  # seeing bright, not yet sure
+        WAITING_CLEAR  = "WAITING_CLEAR"   # confirmed bright, delay before /clear
+
+    def __init__(self, label: str, gate: "GateController"):
+        self.label     = label
+        self._gate     = gate
+        self._state    = self.State.EMPTY
+        self._count    = 0          # confirm-in or confirm-out counter
+        self._gone_at  = 0.0       # time when WAITING_CLEAR started
+        self._lock     = threading.Lock()
+
+    @property
+    def state(self) -> "SlotOccupancyDetector.State":
+        with self._lock: return self._state
+
+    def update(self, frame: np.ndarray):
+        """Call every processed frame.  Sends /car or /clear as needed."""
+        # Mean brightness of the whole frame (grayscale)
+        gray       = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        brightness = float(np.mean(gray))
+        is_dark    = brightness < SLOT_DARK_THRESHOLD
+
+        with self._lock:
+            state = self._state
+
+        if state == self.State.EMPTY:
+            if is_dark:
+                with self._lock:
+                    self._count += 1
+                    if self._count >= SLOT_CONFIRM_IN:
+                        self._state = self.State.OCCUPIED
+                        self._count = 0
+                        print(f"  [{self.label}] SlotOccupancy → OCCUPIED "
+                              f"(brightness={brightness:.1f})")
+                        log_event("slot_occupied", camera=self.label,
+                                  brightness=round(brightness, 1))
+                        # Tell ESP32 a car is present — arm locks down
+                        threading.Thread(target=self._gate._do, args=("car",),
+                                         daemon=True).start()
+            else:
+                with self._lock:
+                    self._count = 0   # reset on any bright frame
+
+        elif state == self.State.CONFIRMING_IN:
+            # This state is unused in the simplified two-step above but
+            # kept for future hysteresis tuning.
+            pass
+
+        elif state == self.State.OCCUPIED:
+            if not is_dark:
+                with self._lock:
+                    self._count += 1
+                    if self._count >= SLOT_CONFIRM_OUT:
+                        self._state  = self.State.WAITING_CLEAR
+                        self._count  = 0
+                        self._gone_at = time.time()
+                        print(f"  [{self.label}] SlotOccupancy → WAITING_CLEAR "
+                              f"(brightness={brightness:.1f}, "
+                              f"delay={SLOT_CAR_GONE_DELAY_S:.0f}s)")
+                        log_event("slot_clearing", camera=self.label,
+                                  brightness=round(brightness, 1),
+                                  delay_s=SLOT_CAR_GONE_DELAY_S)
+            else:
+                with self._lock:
+                    self._count = 0   # car still there
+
+        elif state == self.State.WAITING_CLEAR:
+            if is_dark:
+                # Car came back during the delay — abort clear
+                with self._lock:
+                    self._state = self.State.OCCUPIED
+                    self._count = 0
+                print(f"  [{self.label}] SlotOccupancy → car returned, back to OCCUPIED")
+                log_event("slot_reoccupied", camera=self.label,
+                          brightness=round(brightness, 1))
+                # Reaffirm to ESP32
+                threading.Thread(target=self._gate._do, args=("car",),
+                                 daemon=True).start()
+            else:
+                elapsed = time.time() - self._gone_at
+                if elapsed >= SLOT_CAR_GONE_DELAY_S:
+                    with self._lock:
+                        self._state = self.State.EMPTY
+                        self._count = 0
+                    print(f"  [{self.label}] SlotOccupancy → EMPTY "
+                          f"(waited {elapsed:.0f}s)")
+                    log_event("slot_empty", camera=self.label,
+                              waited_s=round(elapsed, 1))
+                    # Tell ESP32 the car is gone — arm may rise
+                    threading.Thread(target=self._gate._do, args=("clear",),
+                                     daemon=True).start()
+
+    def overlay_text(self) -> str:
+        """Short string for the video overlay."""
+        with self._lock:
+            s = self._state
+        labels = {
+            self.State.EMPTY:          "slot: EMPTY",
+            self.State.CONFIRMING_IN:  "slot: arriving...",
+            self.State.OCCUPIED:       "slot: OCCUPIED",
+            self.State.CONFIRMING_OUT: "slot: leaving...",
+            self.State.WAITING_CLEAR:  "slot: confirming clear",
+        }
+        return labels.get(s, "slot: ?")
+
+    def reset(self):
+        with self._lock:
+            self._state = self.State.EMPTY
+            self._count = 0
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 12. STABLE-DETECTION COUNTER
 # ══════════════════════════════════════════════════════════════════════════
 
 class StableDetectionCounter:
@@ -648,7 +796,7 @@ class StableDetectionCounter:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 11. GATE CONTROLLER  [FIX-3]
+# 13. GATE CONTROLLER
 # ══════════════════════════════════════════════════════════════════════════
 
 class GateState(Enum):
@@ -656,44 +804,58 @@ class GateState(Enum):
 
 
 class GateController:
-    """
-    [FIX-3] ONE TrackedLock for own state only.
-    Never calls registry while locked.
-    acquire_and_open() releases lock before calling park_mon or _fire().
+    """HTTP gate controller with full thread safety.
+
+    [ENH-1]  record_gate_open() called only after HTTP open succeeds.
+    [ENH-2]  _last_det seeded with time.time() — no bogus linger-loop exit.
+    [ENH-3]  is_dark property for safe external access.
+    [ENH-4]  update_car/update_light read state under lock.
+    [ENH-5]  HTTP failure path fully releases the internal lock.
     """
 
     def __init__(self, gate_ip: str, label: str,
                  park_mon: ParkingMonitor, registry: GlobalPlateRegistry,
+                 device_type: str = "gate",
                  open_dur: float = GATE_OPEN_DURATION):
-        self.gate_ip  = gate_ip
-        self.label    = label
-        self._pm      = park_mon
-        self._reg     = registry
-        self.open_dur = open_dur
-        self._mu      = _register_lock(TrackedLock(f"Gate-{label}"))
-        self._state   = GateState.IDLE
-        self._locked  = False
-        self._lu      = 0.0
-        self._plate   = ""
+        self.gate_ip     = gate_ip
+        self.label       = label
+        self.device_type = device_type
+        self._pm         = park_mon
+        self._reg        = registry
+        self.open_dur    = open_dur
+        self._mu         = _register_lock(TrackedLock(f"Gate-{label}"))
+        self._state      = GateState.IDLE
+        self._locked     = False
+        self._lu         = 0.0
+        self._plate      = ""
         self._timer: Optional[threading.Timer] = None
-        self._last_det = 0.0
-        self._car      = False
-        self._dark     = False
-        self._car_ts   = 0.0
-        self._light_ts = 0.0
+        self._last_det   = time.time()   # [ENH-2] seeded to now
+        self._car        = False
+        self._dark       = False
+        self._car_ts     = 0.0
+        self._light_ts   = 0.0
+
+    # ── Properties ──────────────────────────────────────────────────────
 
     @property
-    def state(self): return self._state
+    def state(self) -> GateState:
+        return self._state
 
     def is_idle(self) -> bool:
         with self._mu: return not self._locked
 
+    @property
+    def is_dark(self) -> bool:
+        """[ENH-3] Thread-safe low-light state read."""
+        with self._mu: return self._dark
+
+    def get_open_plate(self) -> str:
+        with self._mu: return self._plate if self._locked else ""
+
+    # ── Open / close ────────────────────────────────────────────────────
+
     def acquire_and_open(self, plate: str,
                          frame: Optional[np.ndarray] = None) -> bool:
-        """
-        Open gate for plate.
-        [FIX-3] Releases own lock before calling park_mon or firing HTTP.
-        """
         with self._mu:
             now = time.monotonic()
             if self._locked:
@@ -703,7 +865,7 @@ class GateController:
                     if self._timer: self._timer.cancel(); self._timer = None
             if self._locked:
                 print(f"  [{self.label}] Gate busy "
-                      f"{max(0, self._lu-now):.1f}s left")
+                      f"{max(0, self._lu - now):.1f}s left")
                 return False
             self._locked = True
             self._plate  = plate
@@ -714,18 +876,43 @@ class GateController:
             self._timer.start()
             log_event("gate_acquired", camera=self.label, plate=plate)
 
-        # ── Own lock released — safe to call external code ────────────────
-        if self._pm and frame is not None:
-            self._pm.record_gate_open(frame)
-        self._fire("open")
-        return True
+        # HTTP open (lock released)
+        opened = self._do("open")
+
+        if opened:
+            # [ENH-5] Stamp cooldown + notify parking monitor only on success
+            self._reg.stamp_cooldown(normalize_plate_text(plate))
+            log_event("gate_opened", camera=self.label, plate=plate,
+                      device_type=self.device_type)
+            # [ENH-1] record_gate_open AFTER confirmed open
+            if self._pm and frame is not None:
+                self._pm.record_gate_open(frame)
+        else:
+            # [ENH-5] Release internal lock on failure so next attempt works
+            log_event("gate_open_failed", camera=self.label, plate=plate)
+            with self._mu:
+                if self._timer:
+                    self._timer.cancel()
+                    self._timer = None
+                self._locked = False
+                self._state  = GateState.IDLE
+                self._plate  = ""
+            self._reg.release(plate, self.label)
+
+        return opened
 
     def record_detection(self):
         self._last_det = time.time()
 
     def _auto_release(self):
+        """Auto-close after open_dur, with capped linger for active detection."""
+        linger_start = time.time()
         while time.time() - self._last_det < DETECTION_LINGER:
+            if time.time() - linger_start > MAX_LINGER_CAP_S:
+                print(f"  [{self.label}] Linger cap — forcing close")
+                break
             time.sleep(DETECTION_LINGER)
+
         plate = ""
         with self._mu:
             self._state = GateState.CLOSING
@@ -736,7 +923,6 @@ class GateController:
             self._locked = False
             self._plate  = ""
             self._timer  = None
-        # Release AFTER own lock is free — no inversion risk [FIX-3]
         self._reg.release(plate, self.label)
         log_event("gate_auto_released", camera=self.label, plate=plate)
         print(f"  [{self.label}] Auto-released → IDLE")
@@ -744,6 +930,8 @@ class GateController:
     def close_now(self, reason: str = "exit"):
         plate = ""
         with self._mu:
+            if not self._locked:
+                return           # already idle — nothing to close
             if self._timer: self._timer.cancel(); self._timer = None
             self._state = GateState.CLOSING
             plate = self._plate
@@ -769,50 +957,107 @@ class GateController:
             plate = self._plate; self._plate = ""
         if plate: self._reg.release(plate, self.label)
 
+    def send_keep(self) -> bool:
+        return self._do("keep")
+
+    # ── HTTP ────────────────────────────────────────────────────────────
+
     def _do(self, ep: str) -> bool:
         url = f"{self.gate_ip}/{ep}"
         for i in range(1, GATE_RETRY_COUNT + 1):
             try:
-                if requests.post(url,
-                                 timeout=GATE_HTTP_TIMEOUT).status_code == 200:
+                r = requests.post(url, timeout=GATE_HTTP_TIMEOUT)
+                if r.status_code == 200:
                     return True
             except Exception as e:
                 print(f"  [{self.label}] /{ep} err #{i}: {e}")
-            if i < GATE_RETRY_COUNT: time.sleep(GATE_RETRY_DELAY)
+            if i < GATE_RETRY_COUNT:
+                time.sleep(GATE_RETRY_DELAY)
         return False
 
-    def _fire(self, ep: str):
-        threading.Thread(target=self._do, args=(ep,), daemon=True).start()
+    # ── Presence / light ────────────────────────────────────────────────
 
     def update_car(self, present: bool):
-        if time.time() - self._car_ts < CAR_CHECK_INTERVAL: return
-        if present != self._car:
-            self._car = present; self._fire("car" if present else "clear")
+        """[ENH-4] Read and write _car under lock before spawning thread."""
+        if time.time() - self._car_ts < CAR_CHECK_INTERVAL:
+            return
+        with self._mu:
+            changed   = (present != self._car)
+            self._car = present
+        if changed:
+            ep = "car" if present else "clear"
+            threading.Thread(target=self._do, args=(ep,),
+                             daemon=True).start()
         self._car_ts = time.time()
 
     def update_light(self, dark: bool):
-        if time.time() - self._light_ts < LOW_LIGHT_CHECK_INTERVAL: return
-        if dark != self._dark:
-            self._dark = dark; self._fire("dark" if dark else "light")
+        """[ENH-4] Read and write _dark under lock before spawning thread.
+
+        For gate-type devices, /dark triggers doOpen() on the ESP32.
+        That behaviour is only wanted when DARK_OPEN_GATE is True.
+        For slot-type devices, /dark only turns on the flash — always safe to send.
+        """
+        if time.time() - self._light_ts < LOW_LIGHT_CHECK_INTERVAL:
+            return
+        with self._mu:
+            changed    = (dark != self._dark)
+            self._dark = dark
+        if changed:
+            if dark:
+                # Only send /dark to gate-type when DARK_OPEN_GATE allows it.
+                # Always send to slot-type (flash only, no servo movement).
+                if self.device_type == "slot" or DARK_OPEN_GATE:
+                    threading.Thread(target=self._do, args=("dark",),
+                                     daemon=True).start()
+            else:
+                threading.Thread(target=self._do, args=("light",),
+                                 daemon=True).start()
         self._light_ts = time.time()
+
+    # ── Display ─────────────────────────────────────────────────────────
 
     def overlay_label(self) -> Tuple[str, tuple]:
         with self._mu:
-            st = self._state; lk = self._locked
-            lu = self._lu;    pl = self._plate
+            st   = self._state; lk = self._locked
+            lu   = self._lu;    pl = self._plate
+            dark = self._dark
         rem = max(0.0, lu - time.monotonic()) if lk else 0
-        dk  = " [DARK]" if self._dark else ""
+        dk  = " [DARK]" if dark else ""
         if st == GateState.OPEN:    return (f"OPEN {rem:.0f}s [{pl}]{dk}", (0,255,0))
         if st == GateState.CLOSING: return (f"CLOSING…{dk}", (0,165,255))
         return (f"IDLE{dk}", (180,180,180))
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 12. HELPERS
+# 14. KEEP-ALIVE HEARTBEAT THREAD
+# ══════════════════════════════════════════════════════════════════════════
+
+def _keep_alive_loop(workers: list):
+    """Send /keep to every open gate every KEEP_ALIVE_INTERVAL_S.
+
+    Critical for slot-type ESP32-CAM devices (130s watchdog).
+    Gate-type devices also accept /keep (resets their auto-close timer).
+    """
+    while True:
+        time.sleep(KEEP_ALIVE_INTERVAL_S)
+        for w in workers:
+            try:
+                if not w.gate.is_idle():
+                    plate = w.gate.get_open_plate()
+                    ok    = w.gate.send_keep()
+                    print(f"  [{w.label}] /keep heartbeat "
+                          f"plate={plate!r} ok={ok}")
+            except Exception as e:
+                print(f"  [KeepAlive] {w.label}: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 15. HELPERS
 # ══════════════════════════════════════════════════════════════════════════
 
 def adaptive_ocr_gate(yolo_conf: float) -> float:
-    return BASE_OCR_CONF + ADAPTIVE_SCALE * (1.0 - max(0.35, min(1.0, yolo_conf)))
+    return BASE_OCR_CONF + ADAPTIVE_SCALE * (
+        1.0 - max(0.35, min(1.0, yolo_conf)))
 
 
 def detect_low_light(frame: np.ndarray, is_dark: bool) -> bool:
@@ -822,9 +1067,7 @@ def detect_low_light(frame: np.ndarray, is_dark: bool) -> bool:
 
 def composite_score(yolo_conf: float, ocr_conf: float,
                     correction_score: float) -> float:
-    """[FIX-1] Higher = better candidate for Best-Camera-Wins."""
-    quality = 1.0 - correction_score
-    return yolo_conf * 0.4 + ocr_conf * 0.4 + quality * 0.2
+    return yolo_conf * 0.4 + ocr_conf * 0.4 + (1.0 - correction_score) * 0.2
 
 
 # ── RabbitMQ ─────────────────────────────────────────────────────────────
@@ -856,7 +1099,9 @@ def _publish(payload: dict):
         except Exception as e: print(f"RabbitMQ: {e}")
 
 
-_dbg_n = 0; _dbg_lock = threading.Lock()
+# Debug save counter — initialised from existing files at section 15
+_dbg_n    = 0
+_dbg_lock = threading.Lock()
 
 
 def save_debug(tag: str, raw: np.ndarray, prep: np.ndarray):
@@ -865,7 +1110,7 @@ def save_debug(tag: str, raw: np.ndarray, prep: np.ndarray):
     with _dbg_lock:
         if _dbg_n >= DEBUG_MAX_SAVES: return
         ts = int(time.time() * 1000)
-        cv2.imwrite(f"debug_{ts}_{tag}_raw.jpg", raw)
+        cv2.imwrite(f"debug_{ts}_{tag}_raw.jpg",  raw)
         cv2.imwrite(f"debug_{ts}_{tag}_prep.jpg", prep)
         _dbg_n += 1
 
@@ -879,84 +1124,72 @@ def _roi_mouse_cb(event, x, y, flags, param):
     if event == cv2.EVENT_LBUTTONDOWN:
         pts = _roi_clicks.setdefault(label, [])
         pts.append((x, y))
-        print(f"  [ROI {label}] click #{len(pts)}: ({x}, {y})")
+        print(f"  [ROI {label}] click #{len(pts)}: ({x},{y})")
         if len(pts) == 2:
             x1, y1 = pts[0]; x2, y2 = pts[1]
             roi = (min(x1,x2), min(y1,y2), max(x1,x2), max(y1,y2))
             print(f"\n  ✅  CAMERA_ROI[\"{label}\"] = {roi}"
-                  f"\n  Copy into config and restart with SHOW_ROI_HELPER=False\n")
+                  f"\n  Restart with SHOW_ROI_HELPER=False\n")
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 13. CAMERA WORKER THREAD
+# 16. CAMERA WORKER THREAD
 # ══════════════════════════════════════════════════════════════════════════
 
 class CameraWorker(threading.Thread):
-    """
-    Independent ALPR pipeline per camera.
-
-    [FIX-1] Submits PlateCandidate (with real plate string) to registry.
-            Registry resolves winner and calls _open_gate_cb.
-    [BUG-1] winner.plate is used everywhere — cam_id is never confused
-            with the plate string.
-    [BUG-2] _on_registry_win stub removed entirely. The only callback
-            path is _open_gate_cb, registered via
-            registry.register_open_callback() in __init__.
-    [FIX-3] No lock is held when calling registry or gate methods.
-    """
-
-    def __init__(self, cam_url, gate_ip, flip, label,
-                 model, reader, llm, registry, frame_slot, ocr_sem):
+    def __init__(self, cam_url: str, gate_ip: str, flip: Optional[int],
+                 label: str, device_type: str,
+                 model, reader, llm, registry: GlobalPlateRegistry,
+                 frame_slot: list, ocr_sem: threading.Semaphore):
         super().__init__(name=f"worker-{label}", daemon=True)
-        self.cam_url  = cam_url
-        self.flip     = flip
-        self.label    = label
-        self.model    = model
-        self.reader   = reader
-        self.llm      = llm
-        self.registry = registry
-        self._slot    = frame_slot
-        self._ocr_sem = ocr_sem
-        self._stop    = threading.Event()
+        self.cam_url     = cam_url
+        self.flip        = flip
+        self.label       = label
+        self.device_type = device_type
+        self.model       = model
+        self.reader      = reader
+        self.llm         = llm
+        self.registry    = registry
+        self._slot       = frame_slot
+        self._ocr_sem    = ocr_sem
+        self._stop       = threading.Event()
 
         thr = CAMERA_MOTION.get(label, {})
         roi = CAMERA_ROI.get(label)
-        self.park_mon = ParkingMonitor(label,
-                                       thr.get("movement_frac", 0.04),
-                                       thr.get("exit_frac", 0.06),
-                                       roi)
-        self.gate     = GateController(gate_ip, label, self.park_mon, registry)
+        self.park_mon = ParkingMonitor(
+            label, thr.get("movement_frac", 0.04),
+            thr.get("exit_frac", 0.06), roi)
+        self.gate     = GateController(gate_ip, label, self.park_mon,
+                                       registry, device_type=device_type)
         self.stab_ctr = StableDetectionCounter()
 
-        self._tracker   = PlateTracker()
-        self._voters:    Dict[int, PlateMajorityVoter] = {}
-        self._stability: Dict[int, PlateStabilityGate] = {}
-        self._hist_buf:  Dict[int, deque] = {}
-        self._last_det  = deque(maxlen=CAR_ABSENT_FRAMES)
-        self._fc        = 0
+        # Slot occupancy detector — only active for upward-facing slot cameras.
+        # Gate-type cameras face forward and use YOLO plate detection instead.
+        self.slot_detector: Optional[SlotOccupancyDetector] = (
+            SlotOccupancyDetector(label, self.gate)
+            if device_type == "slot" else None
+        )
 
-        # [BUG-2] Single callback path — no stub _on_registry_win
+        self._tracker:   PlateTracker                    = PlateTracker()
+        self._voters:    Dict[int, PlateMajorityVoter]   = {}
+        self._stability: Dict[int, PlateStabilityGate]   = {}
+        self._hist_buf:  Dict[int, deque]                = {}
+        self._last_det   = deque(maxlen=CAR_ABSENT_FRAMES)
+        self._fc         = 0
+
         registry.register_open_callback(label, self._open_gate_cb)
 
-    # ── Registry win callback  ────────────────────────────────────────────
+    # ── Registry win callback ────────────────────────────────────────────
 
     def _open_gate_cb(self, winner: PlateCandidate):
-        """
-        Called by GlobalPlateRegistry after the challenge window closes
-        and THIS camera's candidate won.
-
-        [BUG-1] winner.plate is the real plate string (e.g. "กข1234").
-        [BUG-2] This is the ONLY path — no dead stubs.
-        [FIX-3] Registry lock is already released before this is called.
-        """
-        plate   = winner.plate          # ← correct: actual plate, not cam_id
-        frame   = winner.frame
+        plate = winner.plate
+        frame = winner.frame
 
         self.gate.record_detection()
-        opened  = self.gate.acquire_and_open(plate=plate, frame=frame)
+        opened = self.gate.acquire_and_open(plate=plate, frame=frame)
 
         prov_en = winner.prov_info["en"] if winner.prov_info else None
-        status  = "🟢 GATE OPEN" if opened else "🔴 gate busy"
+        status  = "🟢 GATE OPEN" if opened else "🔴 gate busy/failed"
         print(f"✅ [{self.label}] {plate}  "
               f"YOLO={winner.yolo_conf:.2f}  OCR={winner.ocr_conf:.2f}  "
               f"score={winner.score:.3f}  {status}")
@@ -966,70 +1199,63 @@ class CameraWorker(threading.Thread):
                   yolo=round(winner.yolo_conf, 4),
                   ocr=round(winner.ocr_conf, 4),
                   score=round(winner.score, 4),
-                  source=winner.source, gate_triggered=opened)
+                  source=winner.source, gate_triggered=opened,
+                  device_type=self.device_type)
 
         _publish({"ts": int(time.time()), "camera": self.label,
                   "plate": plate, "province_en": prov_en,
                   "score": round(winner.score, 4),
                   "gate_triggered": opened})
 
-        # Draw on winner's frame snapshot
         colour = (0, 255, 0) if opened else (0, 165, 255)
         lbl    = f"[{self.label}] {plate}"
-        if prov_en:  lbl += f" {prov_en}"
-        if opened:   lbl += " [OPEN]"
-        else:        lbl += " [GATE BUSY]"
+        if prov_en: lbl += f" {prov_en}"
+        lbl += " [OPEN]" if opened else " [FAILED]"
         cv2.rectangle(frame, (winner.x1, winner.y1),
                       (winner.x2, winner.y2), colour, 2)
         cv2.putText(frame, lbl, (winner.x1, max(winner.y1 - 8, 0)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, colour, 2, cv2.LINE_AA)
 
-    # ── Track helpers ─────────────────────────────────────────────────────
+    # ── Track helpers ────────────────────────────────────────────────────
 
-    def _voter(self, tid):
+    def _voter(self, tid: int) -> PlateMajorityVoter:
         if tid not in self._voters:
             self._voters[tid] = PlateMajorityVoter(
                 window=VOTE_WINDOW, min_votes=VOTE_MIN_VOTES,
                 llm_corrector=self.llm, track_id=tid)
         return self._voters[tid]
 
-    def _stab(self, tid):
+    def _stab(self, tid: int) -> PlateStabilityGate:
         if tid not in self._stability:
             self._stability[tid] = PlateStabilityGate(
                 min_stable_frames=STABILITY_MIN_FRAMES,
                 max_pixel_drift=STABILITY_MAX_DRIFT)
         return self._stability[tid]
 
-    def _hist(self, tid):
+    def _hist(self, tid: int) -> deque:
         if tid not in self._hist_buf:
             self._hist_buf[tid] = deque(maxlen=LLM_CANDIDATE_HISTORY)
         return self._hist_buf[tid]
 
-    def _add_hist(self, tid, results):
+    def _add_hist(self, tid: int, results: list):
         h = self._hist(tid); seen = set(h)
         for r in results:
             if len(r) >= 2:
                 t = str(r[1]).strip()
                 if t and t not in seen: h.append(t); seen.add(t)
 
-    def _cleanup(self, tid):
+    def _cleanup(self, tid: int):
         for d in (self._voters, self._stability, self._hist_buf):
             d.pop(tid, None)
         self.stab_ctr.clear(tid)
         self.llm.invalidate_track(tid)
 
-    # ── Submit plate to registry ───────────────────────────────────────────
+    # ── Submit to registry ───────────────────────────────────────────────
 
     def _submit(self, frame: np.ndarray,
                 plate: str, ocr_conf: float, yolo_conf: float,
                 correction_score: float, prov_info: Optional[dict],
-                source: str,
-                x1: int, y1: int, x2: int, y2: int):
-        """
-        Build PlateCandidate and submit to registry.
-        [BUG-1] plate is stored in candidate.plate — never confused with cam_id.
-        [FIX-3] No lock held here.
-        """
+                source: str, x1: int, y1: int, x2: int, y2: int):
         if not is_plate_allowed(plate):
             log_event("access_denied", camera=self.label, plate=plate)
             cv2.rectangle(frame, (x1,y1),(x2,y2),(0,0,255),2)
@@ -1041,16 +1267,12 @@ class CameraWorker(threading.Thread):
 
         score = composite_score(yolo_conf, ocr_conf, correction_score)
         cand  = PlateCandidate(
-            cam_id=self.label,
-            plate=plate,                 # ← real plate string [BUG-1]
-            score=score,
-            yolo_conf=yolo_conf,
-            ocr_conf=ocr_conf,
+            cam_id=self.label, plate=plate, score=score,
+            yolo_conf=yolo_conf, ocr_conf=ocr_conf,
             correction_score=correction_score,
             x1=x1, y1=y1, x2=x2, y2=y2,
-            prov_info=prov_info,
-            source=source,
-            frame=frame.copy())
+            prov_info=prov_info, source=source,
+            frame=frame.copy(), device_type=self.device_type)
 
         accepted = self.registry.submit_claim(cand)
         colour   = (0, 200, 255) if accepted else (100, 100, 100)
@@ -1059,7 +1281,7 @@ class CameraWorker(threading.Thread):
         cv2.putText(frame, lbl, (x1, max(y1-8,0)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, colour, 2, cv2.LINE_AA)
 
-    # ── Auto-restart wrapper ──────────────────────────────────────────────
+    # ── Auto-restart wrapper ─────────────────────────────────────────────
 
     def run(self):
         print(f"[{self.label}] Worker started  {self.cam_url}")
@@ -1073,19 +1295,26 @@ class CameraWorker(threading.Thread):
                 time.sleep(2.0)
         print(f"[{self.label}] Worker stopped.")
 
-    def _run_inner(self):
-        cap = None
+    def _run_inner(self):  # noqa: C901
+        cap         = None
+        retry_delay = STREAM_RETRY_DELAY
         win = f"ROI Helper — {self.label}" if SHOW_ROI_HELPER else None
         if SHOW_ROI_HELPER and win:
             cv2.namedWindow(win)
             cv2.setMouseCallback(win, _roi_mouse_cb, self.label)
 
         while not self._stop.is_set():
-            # ── Stream ────────────────────────────────────────────────────
+            # ── Stream connect / reconnect  [ENH-7] ──────────────────────
             if cap is None or not cap.isOpened():
                 cap = cv2.VideoCapture(self.cam_url)
                 if not cap.isOpened():
-                    cap = None; time.sleep(STREAM_RETRY_DELAY); continue
+                    cap = None
+                    print(f"[{self.label}] Stream unavailable — "
+                          f"retry in {retry_delay}s")
+                    time.sleep(retry_delay)
+                    retry_delay = min(retry_delay * 2, STREAM_MAX_RETRY_DELAY)
+                    continue
+                retry_delay = STREAM_RETRY_DELAY   # reset on success
                 print(f"[{self.label}] Stream connected.")
 
             ret, frame = cap.read()
@@ -1101,9 +1330,15 @@ class CameraWorker(threading.Thread):
             if self.park_mon.update(frame) and not self.gate.is_idle():
                 self.gate.close_now("park_monitor")
 
-            # Low-light
-            dark = detect_low_light(frame, self.gate._dark)
+            # Low-light  [ENH-3] use property, not direct _dark access
+            dark = detect_low_light(frame, self.gate.is_dark)
             self.gate.update_light(dark)
+
+            # Slot occupancy (upward-facing camera) — runs every frame,
+            # before the FRAME_SKIP gate, so detection is as fast as possible.
+            # This replaces update_car() for slot-type cameras entirely.
+            if self.slot_detector is not None:
+                self.slot_detector.update(frame)
 
             # ROI overlay
             roi = CAMERA_ROI.get(self.label)
@@ -1113,15 +1348,20 @@ class CameraWorker(threading.Thread):
                 cv2.putText(frame, "ROI", (roi[0]+4, roi[1]+14),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0,255,255), 1)
 
-            # Status overlays
             g_lbl, g_col = self.gate.overlay_label()
-            cv2.putText(frame, f"{self.label} | {g_lbl}", (8,22),
+            cv2.putText(frame, f"{self.label} | {g_lbl}", (8, 22),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, g_col, 2, cv2.LINE_AA)
-            cv2.putText(frame, f"Park:{self.park_mon.phase.value}", (8,42),
+            cv2.putText(frame, f"Park:{self.park_mon.phase.value}", (8, 42),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200,200,0), 1,
                         cv2.LINE_AA)
+            if self.slot_detector is not None:
+                slot_txt = self.slot_detector.overlay_text()
+                slot_col = (0,255,0) if "OCCUPIED" in slot_txt else (180,180,180)
+                cv2.putText(frame, slot_txt, (8, 60),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, slot_col, 1,
+                            cv2.LINE_AA)
             if dark:
-                cv2.putText(frame, "LOW LIGHT", (8,60),
+                cv2.putText(frame, "LOW LIGHT", (8, 78),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0,100,255), 1,
                             cv2.LINE_AA)
 
@@ -1135,43 +1375,47 @@ class CameraWorker(threading.Thread):
             try:
                 yres = self.model(frame, verbose=False)[0]
             except Exception as e:
-                print(f"[{self.label}] YOLO: {e}")
+                print(f"[{self.label}] YOLO error: {e}")
                 self._slot[0] = frame.copy(); continue
 
-            fh, fw = frame.shape[:2]
-            boxes: List[Tuple] = []; confs: List[float] = []
+            fh, fw    = frame.shape[:2]
+            boxes:  List[Tuple] = []
+            confs:  List[float] = []
             for b in yres.boxes:
                 x1, y1b, x2, y2b = map(int, b.xyxy[0])
                 yc = float(b.conf[0])
                 if yc < YOLO_CONF_THRESHOLD: continue
-                x1,y1b = max(0,x1),max(0,y1b)
-                x2,y2b = min(fw,x2),min(fh,y2b)
-                if x2<=x1 or y2b<=y1b: continue
-                boxes.append((x1,y1b,x2,y2b)); confs.append(yc)
+                x1, y1b = max(0,x1), max(0,y1b)
+                x2, y2b = min(fw,x2), min(fh,y2b)
+                if x2 <= x1 or y2b <= y1b: continue
+                boxes.append((x1, y1b, x2, y2b))
+                confs.append(yc)
 
             self._last_det.append(len(boxes) > 0)
-            self.gate.update_car(any(self._last_det))
+            # Gate-type cameras: drive car-presence from YOLO plate detection.
+            # Slot-type cameras: slot_detector handles /car and /clear directly
+            # from frame brightness — do not call update_car() here.
+            if self.slot_detector is None:
+                self.gate.update_car(any(self._last_det))
 
             assigns = self._tracker.update(boxes)
 
-            def _yc(box):
-                try: return confs[boxes.index(box)]
-                except: return YOLO_CONF_THRESHOLD
+            # [ENH-6] Safe yolo-conf lookup by index, not list.index()
+            box_conf: Dict[Tuple, float] = dict(zip(boxes, confs))
 
-            for tid, (x1, y1b, x2, y2b) in assigns:
-                yolo_conf = _yc((x1,y1b,x2,y2b))
+            for tid, box in assigns:
+                yolo_conf = box_conf.get(box, YOLO_CONF_THRESHOLD)
+                x1, y1b, x2, y2b = box
                 stab  = self._stab(tid)
                 voter = self._voter(tid)
 
-                # Stability gate
                 if not stab.is_stable(x1, y1b, x2, y2b):
                     cv2.rectangle(frame,(x1,y1b),(x2,y2b),(0,210,210),1)
                     cv2.putText(frame, f"#{tid} stab…",
-                                (x1,max(y1b-5,0)),
+                                (x1, max(y1b-5,0)),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0,210,210),1)
                     continue
 
-                # Skip OCR if barely moved
                 lb = self._tracker.get_last_ocr_box(tid)
                 cx, cy = (x1+x2)/2.0, (y1b+y2b)/2.0
                 if lb:
@@ -1195,7 +1439,7 @@ class CameraWorker(threading.Thread):
                                              x1, y1b, x2, y2b)
                         continue
 
-                self._tracker.set_last_ocr_box(tid, (x1,y1b,x2,y2b))
+                self._tracker.set_last_ocr_box(tid, box)
                 crop = frame[y1b:y2b, x1:x2]
                 if crop.size == 0: continue
 
@@ -1206,27 +1450,26 @@ class CameraWorker(threading.Thread):
                 except Exception as e:
                     print(f"  [{self.label} #{tid}] Prep: {e}"); continue
 
-                # [FIX-3] OCR semaphore — only shared resource between threads
                 with self._ocr_sem:
                     ep = run_easyocr(self.reader, prep)
                     er = run_easyocr_raw(self.reader, crop)
                     ts = run_tesseract(prep)
 
-                self._add_hist(tid, ep+er+ts)
+                self._add_hist(tid, ep + er + ts)
 
                 ocr_min  = adaptive_ocr_gate(yolo_conf)
                 fuse_min = adaptive_min_confidence(yolo_conf)
-                fused    = fuse_ocr_results(ep+er, ts, min_confidence=fuse_min)
+                fused    = fuse_ocr_results(ep + er, ts, min_confidence=fuse_min)
                 fused    = [r for r in fused if float(r[2]) >= ocr_min]
 
                 print(f"  [{self.label} #{tid}] "
                       f"easy={[(r[1],round(float(r[2]),2)) for r in ep]}"
                       f"  gate={ocr_min:.2f} pass={len(fused)}")
 
-                # Province
+                # Province (cached per track)
                 pc = self._tracker.get_province_cache(tid)
                 if pc is None:
-                    pi = extract_province_from_ocr_tokens(ep+er+ts)
+                    pi = extract_province_from_ocr_tokens(ep + er + ts)
                     if not pi:
                         pi = extract_province_from_crop(
                             crop, easyocr_reader=self.reader)
@@ -1238,7 +1481,8 @@ class CameraWorker(threading.Thread):
                 cand = extract_best_plate_read(
                     fused, min_confidence=ocr_min,
                     max_correction_score=MAX_CORRECTION_SCORE)
-                if cand: save_debug(f"{self.label}_t{tid}", crop, prep)
+                if cand:
+                    save_debug(f"{self.label}_t{tid}", crop, prep)
 
                 winner_vote = voter.update(cand, yolo_conf=yolo_conf)
 
@@ -1265,12 +1509,10 @@ class CameraWorker(threading.Thread):
                     pv = self._tracker.get_province_cache(tid)
                     if pv is False: pv = None
                     voter.reset(); stab.reset()
-                    self._tracker.reset_track(tid); self._cleanup(tid)
-
-                    # [FIX-1] Submit to registry (not direct gate open)
+                    self._tracker.reset_track(tid)
+                    self._cleanup(tid)
                     self._submit(frame, plate_text, ocr_conf,
-                                 yolo_conf, corr_score,
-                                 pv, "voter",
+                                 yolo_conf, corr_score, pv, "voter",
                                  x1, y1b, x2, y2b)
 
                 else:
@@ -1283,7 +1525,8 @@ class CameraWorker(threading.Thread):
                             pv = self._tracker.get_province_cache(tid)
                             if pv is False: pv = None
                             voter.reset(); stab.reset()
-                            self._tracker.reset_track(tid); self._cleanup(tid)
+                            self._tracker.reset_track(tid)
+                            self._cleanup(tid)
                             self._submit(frame, pt, lc, yolo_conf, 0.0,
                                          pv, "llm_fallback",
                                          x1, y1b, x2, y2b)
@@ -1299,18 +1542,21 @@ class CameraWorker(threading.Thread):
         self._stop.set()
         self.gate.force_release()
         self.park_mon.reset()
+        if self.slot_detector:
+            self.slot_detector.reset()
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 14. INITIALISATION & DISPLAY LOOP
+# 17. INITIALISATION & DISPLAY LOOP
 # ══════════════════════════════════════════════════════════════════════════
 
-for f in glob.glob("debug_plate_*.jpg"):
-    try: os.remove(f)
-    except OSError: pass
+# [FIX-6] Count existing debug files so new saves always work this session
+_dbg_n = len(glob.glob("debug_*_raw.jpg"))  # matches debug_{ts}_{tag}_raw.jpg
 
 reload_allowed_plates()
 
+threading.Thread(target=_plates_refresh_loop,
+                 daemon=True, name="plates-refresh").start()
 threading.Thread(target=_deadlock_watchdog,
                  daemon=True, name="deadlock-watchdog").start()
 
@@ -1324,15 +1570,17 @@ model      = YOLO(model_path)
 print("Initialising LLM fallback…")
 llm = LLMCorrector()
 
-registry = GlobalPlateRegistry()
-ocr_sem  = threading.Semaphore(2)
-
+registry   = GlobalPlateRegistry()
+ocr_sem    = threading.Semaphore(1)  # EasyOCR reader is not thread-safe; serialize all OCR calls
 frame_slots = [[np.zeros((360, 640, 3), dtype=np.uint8)] for _ in CAMERAS]
 
 workers: List[CameraWorker] = []
-for i, (cam_url, gate_ip, flip, label) in enumerate(CAMERAS):
+for i, cam_cfg in enumerate(CAMERAS):
+    cam_url, gate_ip, flip, label = cam_cfg[0], cam_cfg[1], cam_cfg[2], cam_cfg[3]
+    device_type = cam_cfg[4] if len(cam_cfg) > 4 else "gate"
     w = CameraWorker(
         cam_url=cam_url, gate_ip=gate_ip, flip=flip, label=label,
+        device_type=device_type,
         model=model, reader=reader, llm=llm, registry=registry,
         frame_slot=frame_slots[i], ocr_sem=ocr_sem)
     workers.append(w)
@@ -1340,27 +1588,41 @@ for i, (cam_url, gate_ip, flip, label) in enumerate(CAMERAS):
 for w in workers:
     w.start()
 
-print(f"\n🅿️  Smart Parking ALPR v15.1  ({len(CAMERAS)} cameras)")
-for cam_url, gate_ip, _, label in CAMERAS:
+threading.Thread(target=_keep_alive_loop, args=(workers,),
+                 daemon=True, name="keep-alive").start()
+
+# ── Startup banner  [ENH-8] ──────────────────────────────────────────────
+print(f"\n🅿️  Smart Parking ALPR v15.3  ({len(CAMERAS)} cameras)")
+cam_types = {}
+for cam_cfg in CAMERAS:
+    cam_url, gate_ip, flip, label = cam_cfg[0], cam_cfg[1], cam_cfg[2], cam_cfg[3]
+    device_type = cam_cfg[4] if len(cam_cfg) > 4 else "gate"
+    cam_types[label] = device_type
     thr = CAMERA_MOTION.get(label, {})
     roi = CAMERA_ROI.get(label)
-    print(f"   {label}: {cam_url}  →  gate {gate_ip}"
+    print(f"   {label} [{device_type}]: {cam_url}  →  {gate_ip}"
           f"  ROI={roi}"
           f"  arrive={thr.get('movement_frac')}"
           f"  exit={thr.get('exit_frac')}")
 print(f"   Best-Camera-Wins window : {CLAIM_WINDOW_SEC}s")
 print(f"   Stable gate             : {REQUIRED_STABLE_DETECTIONS} confirmations")
-print(f"   Motion confirm          : {MOTION_CONFIRM_FRAMES} consecutive frames")
-print(f"   Blob filter             : {MIN_BLOB_AREA_FRAC*100:.1f}% of ROI")
+print(f"   Linger cap              : {MAX_LINGER_CAP_S}s")
+print(f"   Keep-alive interval     : {KEEP_ALIVE_INTERVAL_S}s")
+print(f"   Plates refresh          : {PLATES_REFRESH_INTERVAL_S}s")
+print(f"   Stream back-off cap     : {STREAM_MAX_RETRY_DELAY}s")
 if SHOW_ROI_HELPER:
-    print("\n   ⚠️  ROI HELPER MODE — click two corners per camera window")
+    print("\n   ⚠️  ROI HELPER MODE")
 print("   Press Q to quit.\n")
 
-log_event("system_start", cameras=[c[3] for c in CAMERAS],
+log_event("system_start",
+          cameras=[c[3] for c in CAMERAS],
+          device_types=cam_types,
           claim_window=CLAIM_WINDOW_SEC,
           stable_req=REQUIRED_STABLE_DETECTIONS,
-          motion_confirm=MOTION_CONFIRM_FRAMES)
+          linger_cap=MAX_LINGER_CAP_S,
+          keep_alive_s=KEEP_ALIVE_INTERVAL_S)
 
+# ── Display loop ──────────────────────────────────────────────────────────
 while True:
     panels = []
     for slot in frame_slots:
@@ -1372,26 +1634,27 @@ while True:
         panels.append(f)
 
     max_h  = max(p.shape[0] for p in panels)
-    padded = [np.pad(p, ((0, max_h-p.shape[0]),(0,0),(0,0)))
+    padded = [np.pad(p, ((0, max_h - p.shape[0]), (0, 0), (0, 0)))
               for p in panels]
     combined = np.concatenate(padded, axis=1)
 
     active = registry.active_plates()
     if active:
-        info = "  |  ".join(f"{p}→{v['cam_id']}" for p,v in active.items())
+        info = "  |  ".join(f"{p}→{v['cam_id']}" for p, v in active.items())
         cv2.rectangle(combined,
-                      (0, combined.shape[0]-22),
+                      (0, combined.shape[0] - 22),
                       (combined.shape[1], combined.shape[0]),
-                      (20,20,20), -1)
+                      (20, 20, 20), -1)
         cv2.putText(combined, f"Active: {info}",
-                    (8, combined.shape[0]-6),
+                    (8, combined.shape[0] - 6),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0,255,255), 1,
                     cv2.LINE_AA)
 
-    cv2.imshow("Smart Parking ALPR v15.1", combined)
+    cv2.imshow("Smart Parking ALPR v15.3", combined)
     if cv2.waitKey(1) & 0xFF == ord("q"):
         break
 
+# ── Shutdown ──────────────────────────────────────────────────────────────
 print("\nShutting down…")
 log_event("system_stop")
 for w in workers: w.stop()
