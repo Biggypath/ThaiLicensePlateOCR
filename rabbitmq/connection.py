@@ -1,11 +1,11 @@
 """
-rabbitmq/connection.py — Connect to RabbitMQ and assert the 4 SmartPark queues.
+rabbitmq/connection.py — Connect to RabbitMQ and assert the SmartPark OCR queues.
 
 Queues:
   ocr.entry.events   OCR → Backend   (plate read at entrance)
   ocr.exit.events    OCR → Backend   (plate read at exit)
-  ocr.entry.ack      Backend → OCR   (ALLOWED / REJECTED)
-  ocr.exit.ack       Backend → OCR   (OK / ERROR + fee)
+
+ACKs (entry/exit) are sent by the backend directly to ESP32 via MQTT plugin.
 """
 
 import os
@@ -16,8 +16,6 @@ RABBITMQ_URL = os.getenv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672")
 QUEUES = [
     "ocr.entry.events",
     "ocr.exit.events",
-    "ocr.entry.ack",
-    "ocr.exit.ack",
 ]
 
 

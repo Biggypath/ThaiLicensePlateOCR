@@ -50,7 +50,7 @@ from plate_utils import (
     PlateStabilityGate,
 )
 from plate_corrector import is_valid_plate
-from rabbitmq import connect, publish_entry_event, publish_exit_event, start_ack_consumer
+from rabbitmq import connect, publish_entry_event, publish_exit_event
 from camera_registry import get_camera, load_cameras
 from slot_presence import SlotState
 
@@ -80,7 +80,6 @@ ESP32_FLIP_CODE      = cam_cfg.flip_code
 LOT_ID               = cam_cfg.lot_id
 CAM_ID               = cam_cfg.cam_id
 SLOT_ID              = cam_cfg.slot_id
-GATE_URL             = cam_cfg.gate_url
 
 COOLDOWN_TIME        = 10         # seconds before same plate re-fires
 FRAME_SKIP           = 3          # process every Nth frame
@@ -136,11 +135,6 @@ try:
 except Exception as exc:
     print(f"RabbitMQ failed: {exc}")
     raise SystemExit(1)
-
-print("Starting ACK consumer thread...")
-from gate_controller import set_gate_url
-set_gate_url(GATE_URL)
-ack_store = start_ack_consumer()
 
 
 # ══════════════════════════════════════════════════════════════════════════

@@ -7,7 +7,6 @@ Each camera entry:
     "lotId":     "uuid-of-parking-lot",
     "slotId":    "A1",
     "streamUrl": "http://<ESP32_IP>:81/stream",
-    "gateUrl":   "http://<ESP32_IP>",
     "flipCode":  1          // 1=horiz, 0=vert, -1=both, null=off
   }
 
@@ -31,7 +30,6 @@ class CameraConfig:
     lot_id: str
     slot_id: str
     stream_url: str
-    gate_url: str
     flip_code: Optional[int]  # 1, 0, -1, or None
 
 
@@ -45,7 +43,6 @@ def load_cameras(path: str = _CONFIG_PATH) -> list[CameraConfig]:
             lot_id=entry["lotId"],
             slot_id=entry.get("slotId", ""),
             stream_url=entry["streamUrl"],
-            gate_url=entry.get("gateUrl", ""),
             flip_code=entry.get("flipCode"),
         ))
     return cameras
