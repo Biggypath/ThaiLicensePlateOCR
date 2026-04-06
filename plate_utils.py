@@ -613,11 +613,12 @@ def crop_number_zone(bgr_crop: np.ndarray) -> np.ndarray:
 
     cropped = bgr_crop[cut_top: cut_bottom, :]
 
-    # [CV-11] Add white padding so characters never touch the image border
-    PAD = 4
-    ch, cw = cropped.shape[:2]
+    # [CV-11] Add padding — more on left/right (chars clip horizontally)
+    # than top/bottom. 8px sides, 4px top/bottom.
+    PAD_H = 8   # horizontal — fixes right-digit clipping
+    PAD_V = 4   # vertical
     padded = cv2.copyMakeBorder(
-        cropped, PAD, PAD, PAD, PAD,
+        cropped, PAD_V, PAD_V, PAD_H, PAD_H,
         cv2.BORDER_CONSTANT, value=(255, 255, 255),
     )
     return padded
@@ -859,6 +860,14 @@ def extract_best_plate_read(
     """
     [PP-1] Domain-enforced corrector on every OCR candidate.
     [PP-2] Correction-score confidence penalty.
+    [PP-4] Completeness preference — a standard plate (consonants + digits)
+           always beats a digit-only partial read, regardless of confidence.
+           Within the same tier, highest confidence wins.
+           Tiers (highest → lowest):
+             3 = standard plate with leading digit  e.g. 5กข1234
+             2 = standard plate no leading digit    e.g. กข1234
+             1 = digit-only 3–4 chars               e.g. 6912
+             0 = digit-only 1–2 chars               e.g. 69
     """
     if not ocr_results:
         return None
@@ -883,6 +892,7 @@ def extract_best_plate_read(
     if not raw_candidates:
         return None
 
+    # Also try left-to-right merge of all fragments
     merged      = "".join(t for t, _ in raw_candidates)
     merged_conf = float(np.mean([c for _, c in raw_candidates]))
     raw_candidates.append((merged, merged_conf))
@@ -895,7 +905,21 @@ def extract_best_plate_read(
     if not corrected_candidates:
         return None
 
-    return max(corrected_candidates, key=lambda x: x[1])
+    def _completeness_tier(plate: str) -> int:
+        """Higher = more complete / preferred."""
+        from plate_corrector import _PLATE_RE, _SPECIAL_RE
+        norm = plate.upper().strip()
+        m = _PLATE_RE.fullmatch(norm)
+        if m:
+            return 3 if m.group(1) else 2   # with / without leading digit
+        if _SPECIAL_RE.fullmatch(norm):
+            return 1 if len(norm) >= 3 else 0
+        return 0
+
+    # Sort: completeness tier DESC, then confidence DESC
+    corrected_candidates.sort(key=lambda x: (_completeness_tier(x[0]), x[1]),
+                              reverse=True)
+    return corrected_candidates[0]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1051,65 +1075,82 @@ class PlateMajorityVoter:
     [PL-6] extract_leading_digit() called per frame to accumulate evidence.
     """
 
-    RECENCY_BONUS   = 0.10
-    MIN_DIGIT_VOTES = 5
+    RECENCY_BONUS      = 0.10
+    MIN_DIGIT_VOTES    = 3     # frames with same digit string before firing
+    EARLY_EXIT_VOTES   = 3     # consecutive identical valid reads → fire immediately
+    EARLY_EXIT_MIN_OCR = 0.40
 
     def __init__(self, window: int = 8, min_votes: int = 3):
         self.window    = window
         self.min_votes = min_votes
         self._buffer: List[Tuple[str, float, float]] = []
-        # [PL-4] Partial evidence stores
         self._digit_suffix_counter: Counter = Counter()
         self._consonant_candidates: list    = []
-        # [PL-5] Leading digit evidence
         self._leading_digit_counter: Counter = Counter()
+        self._streak_text: Optional[str]    = None
+        self._streak_confs: list            = []
 
-    def update(
-        self,
-        candidate,
-        yolo_conf: float = 1.0,
-    ):
+    def update(self, candidate, yolo_conf: float = 1.0):
         if candidate is not None:
             text, ocr_conf = candidate
 
-            # [PL-6] Extract leading zone digit evidence
+            # [PL-7] Early exit — same valid plate N frames in a row.
+            # BLOCK digit-only early exit if consonants have been seen —
+            # means we have a standard plate and "69" is just a fragment.
+            if is_valid_plate(text):
+                norm = normalize_plate_text(text)
+                is_digit_only = norm.isdigit()
+                has_seen_consonants = bool(self._consonant_candidates)
+
+                if is_digit_only and has_seen_consonants:
+                    # Don't fire — wait for the full plate reconstruction
+                    pass
+                else:
+                    if text == self._streak_text:
+                        self._streak_confs.append(float(ocr_conf))
+                        if len(self._streak_confs) >= self.EARLY_EXIT_VOTES:
+                            avg = float(np.mean(self._streak_confs))
+                            if avg >= self.EARLY_EXIT_MIN_OCR:
+                                print(f"  [Voter PL-7] Early exit: {text} "
+                                      f"x{len(self._streak_confs)} avg_conf={avg:.2f}")
+                                return (text, avg)
+                    else:
+                        self._streak_text  = text
+                        self._streak_confs = [float(ocr_conf)]
+
+            # [PL-6] Leading digit evidence
             leading = extract_leading_digit(text)
             if leading:
                 self._leading_digit_counter[leading] += 1
 
-            # [PL-4] Extract digit suffix evidence
+            # [PL-4] Digit suffix evidence — also track raw digit-only reads
+            # so "69" seen repeatedly contributes even without 4 full digits
             digit_suffix = extract_digit_suffix(text)
             if digit_suffix:
                 self._digit_suffix_counter[digit_suffix] += 1
+            elif normalize_plate_text(text).isdigit():
+                # Raw digit fragment (e.g. "69") — count it directly
+                self._digit_suffix_counter[normalize_plate_text(text)] += 1
 
-            # [PL-4] Extract consonant portion
+            # [PL-4] Consonant evidence
             norm           = normalize_plate_text(text)
-            consonant_part = "".join(
-                c for c in norm if c in _CORRECTOR_CONSONANTS
-            )
+            consonant_part = "".join(c for c in norm if c in _CORRECTOR_CONSONANTS)
             if len(consonant_part) in (2, 3) and float(ocr_conf) > 0.15:
                 if consonant_part not in self._consonant_candidates:
                     self._consonant_candidates.append(consonant_part)
 
-            # [PL-5] Also accumulate 3-char consonant groups with leading digit
-            # e.g. "5กข" from a valid read of "5กข2662"
-            if (len(norm) >= 3 and norm[0].isdigit()
-                    and len(norm) > 4):
-                # extract leading_digit + 2 consonants as a candidate
+            # [PL-5] Leading digit + consonant group (e.g. "5กข")
+            if len(norm) >= 3 and norm[0].isdigit() and len(norm) > 4:
                 cons_with_prefix = "".join(
-                    c for c in norm
-                    if c in _CORRECTOR_CONSONANTS or c.isdigit()
+                    c for c in norm if c in _CORRECTOR_CONSONANTS or c.isdigit()
                 )
-                # take first 3 chars if they match D+C+C pattern
                 if (len(cons_with_prefix) >= 3
                         and cons_with_prefix[0].isdigit()
-                        and all(c in _CORRECTOR_CONSONANTS
-                                for c in cons_with_prefix[1:3])):
-                    candidate_cons = cons_with_prefix[:3]
-                    if candidate_cons not in self._consonant_candidates:
-                        self._consonant_candidates.append(candidate_cons)
+                        and all(c in _CORRECTOR_CONSONANTS for c in cons_with_prefix[1:3])):
+                    cand = cons_with_prefix[:3]
+                    if cand not in self._consonant_candidates:
+                        self._consonant_candidates.append(cand)
 
-            # Full valid plate enters the voting buffer [PP-3]
             if is_valid_plate(text):
                 self._buffer.append((text, float(ocr_conf), float(yolo_conf)))
 
@@ -1137,23 +1178,17 @@ class PlateMajorityVoter:
         # ── [PL-4, PL-5] Partial-evidence reconstruction ──────────────────
         if self._digit_suffix_counter:
             best_suffix, suffix_count = self._digit_suffix_counter.most_common(1)[0]
-            if (suffix_count >= self.MIN_DIGIT_VOTES
-                    and self._consonant_candidates):
-
-                # [PL-5] Determine most-voted leading digit
+            if suffix_count >= self.MIN_DIGIT_VOTES and self._consonant_candidates:
                 best_leading = None
                 if self._leading_digit_counter:
                     best_leading, _ = self._leading_digit_counter.most_common(1)[0]
-
                 reconstructed = merge_digit_evidence(
-                    best_suffix,
-                    self._consonant_candidates,
-                    leading_digit=best_leading,   # [PL-5] pass zone prefix
+                    best_suffix, self._consonant_candidates,
+                    leading_digit=best_leading,
                 )
                 if reconstructed:
-                    print(f"  [Voter PL-4/5] Reconstructed from partial evidence: "
-                          f"{reconstructed[0]} "
-                          f"(digit_suffix={best_suffix} x{suffix_count}, "
+                    print(f"  [Voter PL-4/5] Reconstructed: {reconstructed[0]} "
+                          f"(suffix={best_suffix} x{suffix_count}, "
                           f"consonants={self._consonant_candidates}, "
                           f"leading={best_leading})")
                     return (reconstructed[0], 0.45)
@@ -1165,3 +1200,5 @@ class PlateMajorityVoter:
         self._digit_suffix_counter.clear()
         self._consonant_candidates.clear()
         self._leading_digit_counter.clear()
+        self._streak_text  = None
+        self._streak_confs = []

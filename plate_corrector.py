@@ -1,21 +1,19 @@
 """
-plate_corrector.py — Strict Thai Licence-Plate Format Corrector  (v10)
+plate_corrector.py — Strict Thai Licence-Plate Format Corrector  (v11)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-CHANGES vs v9
+CHANGES vs v10
 ─────────────
-  [PC-6]  extract_digit_suffix() now also returns the leading zone digit
-          (0–9 prefix) when present, as a separate return value.
-          merge_digit_evidence() updated to accept and preserve it.
+  [PC-9]  Special plate support — digit-only plates used on government,
+          military, and royal vehicles:
+            1        ✓  (single digit)
+            11       ✓  (2 digits)
+            111      ✓  (3 digits)
+            1111     ✓  (4 digits)
+          These pass is_valid_plate() and correct_plate() with score 0.0.
+          They are matched by _SPECIAL_RE before _PLATE_RE is tried.
 
-  [PC-7]  merge_digit_evidence() now accepts an optional leading_digit
-          parameter so the voter can reconstruct full plates including
-          the zone prefix (e.g., 5กข2662 not กข2662).
-
-  [PC-8]  extract_leading_digit() helper — pulls the leading zone digit
-          from partial OCR strings (first char if digit and string ≥ 7).
-
-All v9 improvements retained.
+All v10 improvements retained.
 
 THAI PLATE DOMAIN RULES
 ────────────────────────
@@ -26,6 +24,12 @@ Standard passenger plate: [optional 1 digit] [exactly 2 consonants] [exactly 4 d
   กข12            ✗  too few digits
   3บ3099          ✗  only 1 consonant — needs correction
   ฐบ3699          ✓  correct
+
+Special plates (government / military / royal):
+  1               ✓
+  11              ✓
+  111             ✓
+  1111            ✓
 """
 
 import re
@@ -48,7 +52,7 @@ _DIGIT_SET     = set(ARABIC_DIGITS + THAI_DIGITS)
 # Thai vowel diacritics that bleed from province strip — strip in normalise
 _DIACRITIC_SET = set("็่้๊๋์ํ๎ัิีึืุู")
 
-# Canonical plate regex
+# Standard passenger plate regex
 # Group 1: optional leading digit (city/zone code)
 # Group 2: exactly 2 Thai consonants
 # Group 3: exactly 4 Arabic digits
@@ -57,6 +61,12 @@ _PLATE_RE = re.compile(
     r'([' + THAI_CONSONANTS + r']{2})'
     r'([0-9]{4})$'
 )
+
+# [PC-9] Special / government plate regex — 1 to 4 Arabic digits only.
+# NOTE: only fires when NO consonants were seen at all in the frame.
+# If consonants are present alongside digits, the voter waits for a
+# full standard plate read rather than publishing a digit-only fragment.
+_SPECIAL_RE = re.compile(r'^[0-9]{1,4}$')
 
 # ═══════════════════════════════════════════════════════════════════════════
 # CONFUSION MAPS
@@ -537,7 +547,12 @@ def correct_plate(raw: str) -> Tuple[Optional[str], float]:
     if not text:
         return None, 0.0
 
-    # Pass A — already valid
+    # [PC-9] Special plate — digit-only (government / military / royal)
+    # Check before standard passes so "1", "11", "111", "1111" pass through
+    if _SPECIAL_RE.fullmatch(text):
+        return text, 0.0
+
+    # Pass A — already valid standard plate
     result = _pass_a(text)
     if result:
         return result, 0.0
@@ -580,8 +595,13 @@ def _correction_score(original: str, corrected: str) -> float:
 
 
 def is_valid_plate(text: str) -> bool:
-    """Quick structural check without correction."""
-    return bool(_PLATE_RE.fullmatch(normalise_raw(text)))
+    """
+    Quick structural check without correction.
+    Accepts both standard plates (กข1234, 1กข1234) and
+    special digit-only plates (1, 11, 111, 1111).
+    """
+    norm = normalise_raw(text)
+    return bool(_PLATE_RE.fullmatch(norm) or _SPECIAL_RE.fullmatch(norm))
 
 
 def correct_candidates(
