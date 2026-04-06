@@ -1,0 +1,18 @@
+[
+  {
+    "camId": "cam-01",
+    "lotId": "default-lot",
+    "slotId": "A1",
+    "streamUrl": "http://172.20.10.4:81/stream",
+    "gateUrl": "http://172.20.10.4",
+    "flipCode": 1
+  },
+  {
+    "camId": "cam-02",
+    "lotId": "default-lot",
+    "slotId": "A2",
+    "streamUrl": "http://172.20.10.5:81/stream",
+    "gateUrl": "http://172.20.10.5",
+    "flipCode": 1
+  }
+]

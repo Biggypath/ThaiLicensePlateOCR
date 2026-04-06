@@ -9,31 +9,17 @@ This module is called from the RabbitMQ ACK consumer thread
 when the backend replies with ALLOWED / REJECTED / OK / ERROR.
 """
 
-import os
 import urllib.request
 import urllib.error
 import urllib.parse
 
-# Derive the ESP32 gate base URL from ESP32_URL (same IP, port 80)
-# or allow an explicit override via ESP32_GATE_URL.
-_GATE_URL: str | None = None
+_GATE_URL: str = ""
 
 
-def _get_gate_url() -> str:
+def set_gate_url(url: str) -> None:
+    """Set the ESP32 gate base URL (called once at startup from main.py)."""
     global _GATE_URL
-    if _GATE_URL is not None:
-        return _GATE_URL
-
-    explicit = os.getenv("ESP32_GATE_URL")
-    if explicit:
-        _GATE_URL = explicit.rstrip("/")
-        return _GATE_URL
-
-    # Fallback: extract IP from ESP32_URL (the MJPEG stream URL)
-    stream_url = os.getenv("ESP32_URL", "http://172.20.10.4:81/stream")
-    parsed = urllib.parse.urlparse(stream_url)
-    _GATE_URL = f"http://{parsed.hostname}"
-    return _GATE_URL
+    _GATE_URL = url.rstrip("/")
 
 
 def send_gate_command(action: str, timeout: float = 3.0) -> bool:
@@ -43,7 +29,10 @@ def send_gate_command(action: str, timeout: float = 3.0) -> bool:
     action: "open" or "close"
     Returns True if the ESP32 responded with 2xx, False otherwise.
     """
-    base = _get_gate_url()
+    base = _GATE_URL
+    if not base:
+        print("[GATE] No gate URL configured — skipping")
+        return False
     url = f"{base}/gate?action={urllib.parse.quote(action)}"
     try:
         req = urllib.request.Request(url, method="GET")

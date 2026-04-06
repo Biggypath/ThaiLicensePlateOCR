@@ -22,6 +22,8 @@ v9 changes vs v8  (see plate_utils.py and plate_corrector.py for detail):
 import cv2
 import json
 import os
+import sys
+import argparse
 import glob
 import time
 import math
@@ -49,19 +51,36 @@ from plate_utils import (
 )
 from plate_corrector import is_valid_plate
 from rabbitmq import connect, publish_entry_event, publish_exit_event, start_ack_consumer
+from camera_registry import get_camera, load_cameras
+from slot_presence import SlotState
 
 
 # ══════════════════════════════════════════════════════════════════════════
 # 1. CONFIGURATION
 # ══════════════════════════════════════════════════════════════════════════
 
-ESP32_URL            = os.getenv("ESP32_URL", "http://172.20.10.4:81/stream")
-ESP32_FLIP_CODE      = 1          # 1=horiz, 0=vert, -1=both, None=off
+parser = argparse.ArgumentParser(description="Thai licence-plate ALPR")
+parser.add_argument("--camera", "-c", default=None,
+                    help="Camera ID from cameras.json (e.g. cam-01)")
+args = parser.parse_args()
 
-# RabbitMQ — loaded from .env (RABBITMQ_URL is read inside rabbitmq/connection.py)
-CAM_ROLE             = os.getenv("CAM_ROLE", "entry")   # "entry" or "exit"
-LOT_ID               = os.getenv("LOT_ID",   "default-lot")
-CAM_ID               = os.getenv("CAM_ID",   "cam-01")
+# Load camera config from registry
+if args.camera:
+    cam_cfg = get_camera(args.camera)
+else:
+    cameras = load_cameras()
+    if not cameras:
+        print("No cameras defined in cameras.json")
+        sys.exit(1)
+    cam_cfg = cameras[0]
+    print(f"No --camera specified, defaulting to '{cam_cfg.cam_id}'")
+
+ESP32_URL            = cam_cfg.stream_url
+ESP32_FLIP_CODE      = cam_cfg.flip_code
+LOT_ID               = cam_cfg.lot_id
+CAM_ID               = cam_cfg.cam_id
+SLOT_ID              = cam_cfg.slot_id
+GATE_URL             = cam_cfg.gate_url
 
 COOLDOWN_TIME        = 10         # seconds before same plate re-fires
 FRAME_SKIP           = 3          # process every Nth frame
@@ -113,12 +132,14 @@ model      = YOLO(model_path)
 print("Connecting to RabbitMQ...")
 try:
     rmq_conn, rmq_channel = connect()
-    print(f"RabbitMQ connected!  role={CAM_ROLE}  lot={LOT_ID}  cam={CAM_ID}")
+    print(f"RabbitMQ connected!  lot={LOT_ID}  cam={CAM_ID}  slot={SLOT_ID}")
 except Exception as exc:
     print(f"RabbitMQ failed: {exc}")
     raise SystemExit(1)
 
 print("Starting ACK consumer thread...")
+from gate_controller import set_gate_url
+set_gate_url(GATE_URL)
 ack_store = start_ack_consumer()
 
 
@@ -202,6 +223,7 @@ cap              = None
 frame_count      = 0
 last_seen_plates: dict[str, float] = {}
 tracker          = PlateTracker()
+slot             = SlotState()
 
 while True:
     # ── Stream connection ──────────────────────────────────────────────────
@@ -390,17 +412,52 @@ while True:
         stability.reset()
         tracker.reset_track(tid)
 
-        # Build registration string in the format the backend expects
         registration = plate_text
         province_str = province_thai if province_thai else ""
 
-        publish_fn = (publish_entry_event if CAM_ROLE == "entry"
-                      else publish_exit_event)
+        # ── Slot presence logic ────────────────────────────────────────
+        if not slot.is_occupied:
+            # New car arrived → ENTRY
+            slot.park(plate_text, province_str, current_time)
+            try:
+                publish_entry_event(rmq_channel, registration,
+                                    province_str, LOT_ID, CAM_ID)
+                print(f"  Published ENTRY: {registration} "
+                      f"province={province_str}")
+            except Exception:
+                print("RabbitMQ lost — reconnecting...")
+                try:
+                    if rmq_conn and rmq_conn.is_open:
+                        rmq_conn.close()
+                except Exception:
+                    pass
+                rmq_conn, rmq_channel = connect()
+                publish_entry_event(rmq_channel, registration,
+                                    province_str, LOT_ID, CAM_ID)
+        elif slot.plate == plate_text:
+            # Same car still here — refresh last-seen time
+            slot.see(current_time)
+        else:
+            # Different plate on a slot that's occupied — ignore
+            # (could be a misread or a car passing by)
+            print(f"  [#{tid}] Ignoring {plate_text}, "
+                  f"slot occupied by {slot.plate}")
+
+        label = (f"#{tid} {plate_text}  {province_en}"
+                 if province_en else f"#{tid} {plate_text}")
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        cv2.putText(frame, label, (x1, y1 - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2,
+                    cv2.LINE_AA)
+
+    # ── Check for car departure (no plate seen for ABSENCE_TIMEOUT) ────
+    if slot.check_departure(time.time()):
+        departed = slot.plate
+        prov = slot.province or ""
+        print(f"🚗  Car departed: {departed}")
         try:
-            publish_fn(rmq_channel, registration, province_str,
-                       LOT_ID, CAM_ID)
-            print(f"  Published {CAM_ROLE} event: {registration} "
-                  f"province={province_str}")
+            publish_exit_event(rmq_channel, departed, prov, LOT_ID, CAM_ID)
+            print(f"  Published EXIT: {departed}")
         except Exception:
             print("RabbitMQ lost — reconnecting...")
             try:
@@ -409,15 +466,8 @@ while True:
             except Exception:
                 pass
             rmq_conn, rmq_channel = connect()
-            publish_fn(rmq_channel, registration, province_str,
-                       LOT_ID, CAM_ID)
-
-        label = (f"#{tid} {plate_text}  {province_en}"
-                 if province_en else f"#{tid} {plate_text}")
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-        cv2.putText(frame, label, (x1, y1 - 8),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2,
-                    cv2.LINE_AA)
+            publish_exit_event(rmq_channel, departed, prov, LOT_ID, CAM_ID)
+        slot.clear()
 
     cv2.imshow("ESP32-CAM ALPR", frame)
     if cv2.waitKey(1) & 0xFF == ord('q'):
