@@ -25,10 +25,12 @@ import os
 import glob
 import time
 import math
+from dotenv import load_dotenv
 from huggingface_hub import hf_hub_download
 from ultralytics import YOLO
 import easyocr
-import pika
+
+load_dotenv()
 
 from plate_utils import (
     extract_best_plate_read,
@@ -46,20 +48,20 @@ from plate_utils import (
     PlateStabilityGate,
 )
 from plate_corrector import is_valid_plate
+from rabbitmq import connect, publish_entry_event, publish_exit_event, start_ack_consumer
 
 
 # ══════════════════════════════════════════════════════════════════════════
 # 1. CONFIGURATION
 # ══════════════════════════════════════════════════════════════════════════
 
-ESP32_URL            = "http://172.20.10.4:81/stream"
+ESP32_URL            = os.getenv("ESP32_URL", "http://172.20.10.4:81/stream")
 ESP32_FLIP_CODE      = 1          # 1=horiz, 0=vert, -1=both, None=off
 
-RMQ_HOST             = "localhost"
-RMQ_PORT             = 5672
-RMQ_USER             = "guest"
-RMQ_PASS             = "guest"
-RMQ_QUEUE            = "alpr_queue"
+# RabbitMQ — loaded from .env (RABBITMQ_URL is read inside rabbitmq/connection.py)
+CAM_ROLE             = os.getenv("CAM_ROLE", "entry")   # "entry" or "exit"
+LOT_ID               = os.getenv("LOT_ID",   "default-lot")
+CAM_ID               = os.getenv("CAM_ID",   "cam-01")
 
 COOLDOWN_TIME        = 10         # seconds before same plate re-fires
 FRAME_SKIP           = 3          # process every Nth frame
@@ -109,34 +111,15 @@ model_path = hf_hub_download(repo_id=HF_REPO_ID, filename=HF_MODEL_FILENAME)
 model      = YOLO(model_path)
 
 print("Connecting to RabbitMQ...")
-
-
-def connect_rabbitmq():
-    creds  = pika.PlainCredentials(RMQ_USER, RMQ_PASS)
-    params = pika.ConnectionParameters(RMQ_HOST, RMQ_PORT, '/', creds)
-    conn   = pika.BlockingConnection(params)
-    ch     = conn.channel()
-    ch.queue_declare(queue=RMQ_QUEUE, durable=True)
-    return conn, ch
-
-
-def publish_plate(channel, payload_bytes):
-    channel.basic_publish(
-        exchange    = '',
-        routing_key = RMQ_QUEUE,
-        body        = payload_bytes,
-        properties  = pika.BasicProperties(
-            delivery_mode=pika.spec.PERSISTENT_DELIVERY_MODE,
-        ),
-    )
-
-
 try:
-    rmq_conn, rmq_channel = connect_rabbitmq()
-    print("RabbitMQ connected!")
+    rmq_conn, rmq_channel = connect()
+    print(f"RabbitMQ connected!  role={CAM_ROLE}  lot={LOT_ID}  cam={CAM_ID}")
 except Exception as exc:
     print(f"RabbitMQ failed: {exc}")
     raise SystemExit(1)
+
+print("Starting ACK consumer thread...")
+ack_store = start_ack_consumer()
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -407,22 +390,17 @@ while True:
         stability.reset()
         tracker.reset_track(tid)
 
-        payload = {
-            "timestamp"       : int(current_time),
-            "plate_text"      : plate_text,
-            "province_thai"   : province_thai,
-            "province_en"     : province_en,
-            "province_region" : province_region,
-            "yolo_confidence" : round(yolo_conf, 4),
-            "ocr_confidence"  : round(float(ocr_conf), 4),
-            "camera_id"       : "esp32_cam_gate_1",
-            "track_id"        : tid,
-        }
-        json_payload = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        # Build registration string in the format the backend expects
+        registration = plate_text
+        province_str = province_thai if province_thai else ""
 
+        publish_fn = (publish_entry_event if CAM_ROLE == "entry"
+                      else publish_exit_event)
         try:
-            publish_plate(rmq_channel, json_payload)
-            print(f"  Published: {json.dumps(payload, ensure_ascii=False)}")
+            publish_fn(rmq_channel, registration, province_str,
+                       LOT_ID, CAM_ID)
+            print(f"  Published {CAM_ROLE} event: {registration} "
+                  f"province={province_str}")
         except Exception:
             print("RabbitMQ lost — reconnecting...")
             try:
@@ -430,8 +408,9 @@ while True:
                     rmq_conn.close()
             except Exception:
                 pass
-            rmq_conn, rmq_channel = connect_rabbitmq()
-            publish_plate(rmq_channel, json_payload)
+            rmq_conn, rmq_channel = connect()
+            publish_fn(rmq_channel, registration, province_str,
+                       LOT_ID, CAM_ID)
 
         label = (f"#{tid} {plate_text}  {province_en}"
                  if province_en else f"#{tid} {plate_text}")
@@ -455,5 +434,6 @@ cv2.destroyAllWindows()
 try:
     if rmq_conn and rmq_conn.is_open:
         rmq_conn.close()
+        print("RabbitMQ connection closed.")
 except Exception:
     pass
