@@ -11,7 +11,7 @@ Queues:
 import os
 import pika
 
-RABBITMQ_URL = os.getenv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672")
+RABBITMQ_URL = os.getenv("RABBITMQ_URL", "amqp://smartpark:smartpark_secret@localhost:5672")
 
 QUEUES = [
     "ocr.entry.events",

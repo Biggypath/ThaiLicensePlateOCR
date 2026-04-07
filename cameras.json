@@ -5,6 +5,8 @@
     "slotId": "A1",
     "streamUrl": "http://172.20.10.7:81/stream",
     "gateUrl": "http://172.20.10.4",
+    "camUrl": "http://172.20.10.7",
+    "currentPlate": "ฐบ3699",
     "flipCode": 1
   },
   {
@@ -13,6 +15,8 @@
     "slotId": "A2",
     "streamUrl": "http://172.20.10.8:81/stream",
     "gateUrl": "http://172.20.10.5",
+    "camUrl": "http://172.20.10.8",
+    "currentPlate": null,
     "flipCode": 1
   }
 ]

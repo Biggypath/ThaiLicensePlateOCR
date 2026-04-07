@@ -1,24 +1,31 @@
 """
 main.py — Thai licence-plate ALPR  (ESP32-CAM → YOLO → OCR → RabbitMQ)
 
-FLOW (v11 — overlay: gate status, ultrasonic distance, detection timing)
-──────────────────────────────────────────────────────────────────────────
+FLOW (v12 — fixes: HUD ultrasonic/gate display, plate persistence in cameras.json)
+──────────────────────────────────────────────────────────────────────────────────
 
-Changes vs v10:
-  [UI-1] StatusPoller thread polls gate board GET /status every
-         POLL_INTERVAL_S seconds.  camUrl is optional — if absent,
-         ultrasonic is read from gateUrl/status only.
-  [UI-2] draw_overlay() paints a semi-transparent HUD on every frame:
-           • Gate status  (OPEN / CLOSED / UNKNOWN)
-           • Slot status  (OCCUPIED plate / FREE)
-           • Ultrasonic   (cm value from gate or cam board)
-           • Last detection timing (YOLO ms / OCR ms / Total ms)
-  [UI-3] Per-iteration timing: t_yolo, t_ocr measured and stored
-         in DetectionTimer; shown in overlay even when no plate is won.
-  [UI-4] Thai-text rendering via Pillow (PIL) so ก–ฮ characters display
-         correctly instead of "??????". Falls back gracefully if no Thai
-         font is found (prints a warning at startup).
-  All v10 logic retained unchanged.
+Changes vs v11:
+  [FIX-1] StatusCache.update_gate() now reads "arm_down" (bool) from the gate
+           board JSON instead of the non-existent "gate_open" key.
+           The gate board (esp32_motor_ultrasonic.ino) exposes:
+             "arm_down": true/false   — whether the arm is currently down
+             "slot_state": "BLOCKED"|"OPEN"|"OCCUPIED"|"CONFIRMING"|"EXITING"
+           HUD now correctly shows OPEN/CLOSED and the slot FSM state.
+
+  [FIX-2] StatusCache._extract_us() adds "ultra_distance_cm" as the highest-
+           priority key because that is what the gate board actually returns.
+           Previously the HUD always showed "-.-- cm" even when data arrived.
+
+  [FIX-3] draw_overlay() shows the gate board's slot_state string (e.g.
+           OCCUPIED / CONFIRMING) in addition to OPEN/CLOSED so operators
+           can see the full parking lifecycle at a glance.
+
+  [FIX-4] update_camera_plate() is called after every plate detection and
+           after every slot clear, persisting the current plate into
+           cameras.json so external services can read it without querying
+           the live Python process.
+
+All v11 logic retained unchanged.
 """
 
 import cv2
@@ -67,7 +74,7 @@ from plate_utils import (
 )
 from plate_corrector import is_valid_plate
 from rabbitmq import connect, publish_entry_event, publish_exit_event, start_ack_consumer
-from camera_registry import get_camera, load_cameras
+from camera_registry import get_camera, load_cameras, update_camera_plate   # [FIX-4]
 from slot_presence import SlotState
 import gate_controller
 
@@ -96,8 +103,8 @@ ESP32_FLIP_CODE      = cam_cfg.flip_code
 LOT_ID               = cam_cfg.lot_id
 CAM_ID               = cam_cfg.cam_id
 SLOT_ID              = cam_cfg.slot_id
-GATE_URL             = cam_cfg.gate_url                      # gate board HTTP base
-CAM_URL              = getattr(cam_cfg, "cam_url", "")       # cam board HTTP base (optional)
+GATE_URL             = cam_cfg.gate_url
+CAM_URL              = getattr(cam_cfg, "cam_url", "")
 
 COOLDOWN_TIME        = 10
 FRAME_SKIP           = 3
@@ -129,17 +136,13 @@ STATUS_HTTP_TIMEOUT  = 1.5
 # 2. THAI FONT LOADER  [UI-4]
 # ══════════════════════════════════════════════════════════════════════════
 
-# Search order: place a font file next to main.py first for portability.
 _THAI_FONT_CANDIDATES = [
-    # ── drop a font here next to main.py (highest priority) ──────────────
     os.path.join(os.path.dirname(__file__), "NotoSansThai-Regular.ttf"),
     os.path.join(os.path.dirname(__file__), "Tahoma.ttf"),
     os.path.join(os.path.dirname(__file__), "thai_font.ttf"),
-    # ── macOS system ──────────────────────────────────────────────────────
     "/System/Library/Fonts/Supplemental/Tahoma.ttf",
     "/Library/Fonts/Tahoma.ttf",
     "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
-    # ── Linux / Raspberry Pi (apt install fonts-thai-tlwg) ───────────────
     "/usr/share/fonts/truetype/tlwg/TlwgTypo.ttf",
     "/usr/share/fonts/truetype/tlwg/Garuda.ttf",
     "/usr/share/fonts/truetype/noto/NotoSansThai-Regular.ttf",
@@ -181,12 +184,7 @@ def put_thai_text(img_bgr: np.ndarray,
                   pos: tuple,
                   font_size: int = 16,
                   color_bgr: tuple = (240, 240, 240)) -> np.ndarray:
-    """
-    [UI-4] Render Unicode/Thai text onto a BGR numpy array via PIL.
-    Returns the (possibly modified) array.  Falls back to cv2.putText
-    for ASCII-only strings or when PIL is unavailable.
-    """
-    # Fast path: if every character is ASCII, cv2 handles it fine
+    """[UI-4] Render Unicode/Thai text onto a BGR numpy array via PIL."""
     if all(ord(c) < 128 for c in text):
         cv2.putText(img_bgr, text, (pos[0], pos[1] + font_size - 4),
                     cv2.FONT_HERSHEY_SIMPLEX, font_size / 28.0,
@@ -195,7 +193,6 @@ def put_thai_text(img_bgr: np.ndarray,
 
     font = _get_pil_font(font_size)
     if font is None:
-        # PIL unavailable — best effort ASCII fallback
         cv2.putText(img_bgr, text.encode("ascii", "replace").decode(),
                     (pos[0], pos[1] + font_size - 4),
                     cv2.FONT_HERSHEY_SIMPLEX, font_size / 28.0,
@@ -205,48 +202,86 @@ def put_thai_text(img_bgr: np.ndarray,
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     pil_img = Image.fromarray(img_rgb)
     draw    = ImageDraw.Draw(pil_img)
-    # PIL fill = RGB
     draw.text(pos, text, font=font,
               fill=(color_bgr[2], color_bgr[1], color_bgr[0]))
     return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 3. STATUS CACHE  [UI-1]
+# 3. STATUS CACHE  [UI-1] + [FIX-1] [FIX-2] [FIX-3]
 # ══════════════════════════════════════════════════════════════════════════
 
 @dataclass
 class StatusCache:
-    """Thread-safe cache for gate board / cam board /status responses."""
+    """
+    Thread-safe cache for gate board / cam board /status responses.
+
+    [FIX-1] update_gate() now reads "arm_down" (the key the gate board
+            actually returns) instead of the missing "gate_open" key.
+            arm_down=True  → gate is OPEN  (arm is physically down)
+            arm_down=False → gate is CLOSED/BLOCKED (arm is up)
+
+    [FIX-2] _extract_us() now lists "ultra_distance_cm" first — that is
+            the exact key name used by esp32_motor_ultrasonic.ino.
+
+    [FIX-3] slot_state_str holds the human-readable FSM state from the
+            gate board ("BLOCKED", "OPEN", "OCCUPIED", "CONFIRMING",
+            "EXITING") and is shown in the HUD overlay.
+    """
     _lock:           threading.Lock = field(default_factory=threading.Lock, repr=False)
 
-    gate_open:       Optional[bool]  = None   # True=OPEN, False=CLOSED, None=unknown
-    gate_ultrasonic: Optional[float] = None   # cm — gate board
-    cam_ultrasonic:  Optional[float] = None   # cm — cam board (optional)
+    gate_open:       Optional[bool]  = None   # True=arm DOWN (open), False=arm UP (blocked)
+    slot_state_str:  Optional[str]   = None   # [FIX-3] e.g. "OCCUPIED", "CONFIRMING"
+    gate_ultrasonic: Optional[float] = None   # cm — gate board ultrasonic
+    cam_ultrasonic:  Optional[float] = None   # cm — cam board ultrasonic (optional)
     notify_pending:  Optional[bool]  = None
 
     @staticmethod
     def _extract_us(data: dict) -> Optional[float]:
-        """Try multiple common key names for ultrasonic distance."""
-        for key in ("ultrasonic_cm", "distance_cm", "ultrasonic", "us_cm", "dist"):
+        """
+        [FIX-2] Try multiple key names for ultrasonic distance.
+        "ultra_distance_cm" is listed first — it is the exact key returned
+        by esp32_motor_ultrasonic.ino's /status and /ustatus endpoints.
+        """
+        for key in ("ultra_distance_cm", "ultrasonic_cm", "distance_cm",
+                    "ultrasonic", "us_cm", "dist"):
             raw = data.get(key)
             if raw is not None:
                 try:
-                    return float(raw)
+                    val = float(raw)
+                    if val > 0:   # sensor returns -1 on timeout
+                        return val
                 except (TypeError, ValueError):
                     pass
         return None
 
-    def update_gate(self, data: dict):
+    def update_gate(self, data: dict) -> None:
+        """
+        [FIX-1] Parse gate board /status JSON.
+
+        Gate board keys used:
+          "arm_down"   : bool  — True when arm is physically DOWN (slot open)
+          "slot_state" : str   — FSM state name
+          "ultra_distance_cm" : float — distance reading in cm
+        """
         with self._lock:
-            raw = data.get("gate_open")
+            # [FIX-1] arm_down=True means slot is OPEN (arm lowered)
+            raw = data.get("arm_down")
             if raw is not None:
                 self.gate_open = bool(raw)
+
+            # [FIX-3] Store the full slot-state string for the HUD
+            ss = data.get("slot_state")
+            if ss is not None:
+                self.slot_state_str = str(ss)
+
+            # [FIX-2] Ultrasonic distance
             us = self._extract_us(data)
             if us is not None:
                 self.gate_ultrasonic = us
 
-    def update_cam(self, data: dict):
+    def update_cam(self, data: dict) -> None:
+        """Parse cam board /status JSON."""
         with self._lock:
             us = self._extract_us(data)
             if us is not None:
@@ -256,9 +291,11 @@ class StatusCache:
                 self.notify_pending = bool(raw)
 
     def snapshot(self):
+        """Return a consistent (gate_open, slot_state_str, gate_us, cam_us, notify_pending) tuple."""
         with self._lock:
             return (
                 self.gate_open,
+                self.slot_state_str,
                 self.gate_ultrasonic,
                 self.cam_ultrasonic,
                 self.notify_pending,
@@ -270,7 +307,7 @@ _stop_poller = threading.Event()
 
 
 def _status_poller():
-    """[UI-1] Background thread — polls /status endpoints."""
+    """[UI-1] Background thread — polls /status endpoints every POLL_INTERVAL_S."""
     while not _stop_poller.is_set():
         if GATE_URL:
             try:
@@ -293,7 +330,8 @@ def _status_poller():
         _stop_poller.wait(POLL_INTERVAL_S)
 
 
-_poller_thread = threading.Thread(target=_status_poller, daemon=True, name="StatusPoller")
+_poller_thread = threading.Thread(target=_status_poller, daemon=True,
+                                  name="StatusPoller")
 _poller_thread.start()
 print(f"[UI] Status poller started  gate={GATE_URL}  "
       f"cam={CAM_URL or '(none)'}  interval={POLL_INTERVAL_S}s")
@@ -324,12 +362,12 @@ det_timer = DetectionTimer()
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 5. HUD OVERLAY  [UI-2]
+# 5. HUD OVERLAY  [UI-2] + [FIX-1] [FIX-2] [FIX-3]
 # ══════════════════════════════════════════════════════════════════════════
 
 _PAD        = 8
 _LINE_H     = 24
-_FONT_SZ    = 16   # PIL font size — keep in sync with _LINE_H
+_FONT_SZ    = 16
 
 # BGR colour palette
 _C_BG      = (20,  20,  20)
@@ -340,38 +378,59 @@ _C_YELLOW  = ( 30, 210, 210)
 _C_CYAN    = (200, 180,  20)
 _C_GREY    = (150, 150, 150)
 _C_ORANGE  = ( 30, 140, 220)
+_C_PURPLE  = (200,  80, 200)
 
-# Fixed column widths (px)
-_LABEL_W   = 72
+_LABEL_W        = 84   # slightly wider to fit "Slot FSM"
 _VALUE_X_OFFSET = _PAD + _LABEL_W
+
+# Colour coding for gate FSM states  [FIX-3]
+_SLOT_STATE_COLORS = {
+    "BLOCKED":    _C_RED,
+    "OPEN":       _C_GREEN,
+    "OCCUPIED":   _C_ORANGE,
+    "CONFIRMING": _C_YELLOW,
+    "EXITING":    _C_PURPLE,
+}
 
 
 def draw_overlay(frame: np.ndarray, slot: SlotState) -> np.ndarray:
     """
     [UI-2] Semi-transparent HUD — top-left corner.
-    All text rendered via put_thai_text so Thai chars display correctly.
-    """
-    gate_open, gate_us, cam_us, _ = status_cache.snapshot()
 
-    # ── Build rows: (label_str, value_str, value_colour) ─────────────────
+    [FIX-1] Gate row now reflects the real arm_down key from the gate board.
+    [FIX-2] Ultrasonic rows now show actual values (ultra_distance_cm fix).
+    [FIX-3] New "Slot FSM" row shows gate board state machine status.
+    """
+    gate_open, slot_state_str, gate_us, cam_us, _ = status_cache.snapshot()
+
     rows: list[tuple[str, str, tuple]] = []
 
+    # ── Camera / slot identity ─────────────────────────────────────────
     rows.append(("CAM", f"{CAM_ID}  slot {SLOT_ID}", _C_CYAN))
 
+    # ── Gate arm status [FIX-1] ───────────────────────────────────────
     if gate_open is None:
-        rows.append(("Gate", "UNKNOWN", _C_GREY))
+        rows.append(("Gate arm", "UNKNOWN", _C_GREY))
     elif gate_open:
-        rows.append(("Gate", "OPEN", _C_GREEN))
+        rows.append(("Gate arm", "DOWN (open)", _C_GREEN))
     else:
-        rows.append(("Gate", "CLOSED", _C_RED))
+        rows.append(("Gate arm", "UP (blocked)", _C_RED))
 
+    # ── Gate FSM state [FIX-3] ───────────────────────────────────────
+    if slot_state_str:
+        fsmcol = _SLOT_STATE_COLORS.get(slot_state_str, _C_WHITE)
+        rows.append(("Slot FSM", slot_state_str, fsmcol))
+    else:
+        rows.append(("Slot FSM", "---", _C_GREY))
+
+    # ── Ultrasonic — gate board [FIX-2] ──────────────────────────────
     rows.append((
         "US gate",
         f"{gate_us:.1f} cm" if gate_us is not None else "-.-- cm",
         _C_YELLOW if gate_us is not None else _C_GREY,
     ))
 
-    # Cam ultrasonic row only if cam_url is set
+    # ── Ultrasonic — cam board (only if cam_url configured) ───────────
     if CAM_URL:
         rows.append((
             "US cam",
@@ -379,13 +438,14 @@ def draw_overlay(frame: np.ndarray, slot: SlotState) -> np.ndarray:
             _C_YELLOW if cam_us is not None else _C_GREY,
         ))
 
+    # ── Python-side slot state ─────────────────────────────────────────
     if slot.is_occupied:
-        rows.append(("Slot", slot.plate, _C_GREEN))
+        rows.append(("Py slot", slot.plate, _C_GREEN))
     else:
-        rows.append(("Slot", "FREE", _C_GREY))
+        rows.append(("Py slot", "FREE", _C_GREY))
 
+    # ── Detection timing ───────────────────────────────────────────────
     rows.append(("", "-- detection --", _C_GREY))
-
     rows.append(("YOLO",  f"{det_timer.yolo_ms:.1f} ms",  _C_WHITE))
     rows.append(("OCR",   f"{det_timer.ocr_ms:.1f} ms",   _C_WHITE))
     rows.append(("Total", f"{det_timer.total_ms:.1f} ms", _C_WHITE))
@@ -394,29 +454,25 @@ def draw_overlay(frame: np.ndarray, slot: SlotState) -> np.ndarray:
         prov_suffix = f"  {det_timer.province}" if det_timer.province else ""
         rows.append(("Plate", det_timer.plate + prov_suffix, _C_GREEN))
 
-    # ── Panel size ────────────────────────────────────────────────────────
+    # ── Panel geometry ─────────────────────────────────────────────────
     n_rows  = len(rows)
-    panel_w = 260
+    panel_w = 280   # slightly wider for "Slot FSM" label
     panel_h = n_rows * _LINE_H + _PAD * 2
     x0, y0  = 8, 8
 
-    # Semi-transparent background
     overlay = frame.copy()
     cv2.rectangle(overlay, (x0, y0), (x0 + panel_w, y0 + panel_h),
                   _C_BG, cv2.FILLED)
     cv2.addWeighted(overlay, 0.60, frame, 0.40, 0, frame)
 
-    # ── Draw each row ─────────────────────────────────────────────────────
     for i, (lbl, val, col) in enumerate(rows):
-        row_top = y0 + _PAD + i * _LINE_H   # top of this row's text cell
+        row_top = y0 + _PAD + i * _LINE_H
 
-        # Label (ASCII — cv2 is fine)
         if lbl:
             cv2.putText(frame, lbl,
                         (x0 + _PAD, row_top + _FONT_SZ - 2),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.48, _C_GREY, 1, cv2.LINE_AA)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, _C_GREY, 1, cv2.LINE_AA)
 
-        # Value — may contain Thai, use PIL [UI-4]
         vx = x0 + _VALUE_X_OFFSET if lbl else x0 + _PAD
         frame = put_thai_text(frame, val,
                               pos=(vx, row_top),
@@ -427,7 +483,7 @@ def draw_overlay(frame: np.ndarray, slot: SlotState) -> np.ndarray:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 6. SLOT STATE
+# 6. SLOT STATE + RABBITMQ
 # ══════════════════════════════════════════════════════════════════════════
 
 slot = SlotState()
@@ -464,7 +520,11 @@ def _publish_exit(plate: str, province: str) -> None:
 
 
 def on_departure(cam_id: str) -> None:
-    """[FLOW-3] Called by gate_controller poll thread on 60-s clear."""
+    """
+    Called by gate_controller poll thread when ultrasonic 60-s clear confirmed.
+
+    [FIX-4] Clears currentPlate in cameras.json after the exit event is published.
+    """
     if not slot.is_occupied:
         print(f"[Departure] {cam_id} signal but slot not occupied — ignoring")
         return
@@ -473,6 +533,7 @@ def on_departure(cam_id: str) -> None:
     print(f"Car departed (ultrasonic confirmed): {departed_plate}")
     _publish_exit(departed_plate, departed_province)
     slot.clear()
+    update_camera_plate(CAM_ID, None)   # [FIX-4] clear from cameras.json
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -511,6 +572,12 @@ gate_controller.start_departure_polling(
     rmq_channel_getter=None,
 )
 print(f"[FLOW] Departure polling started → {CAM_URL or GATE_URL}")
+
+# ── On startup, restore slot state from cameras.json if plate is present ─
+if cam_cfg.current_plate:
+    print(f"[FIX-4] Restoring slot state from cameras.json: "
+          f"{cam_cfg.current_plate}")
+    slot.park(cam_cfg.current_plate, "", time.time())
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -743,9 +810,10 @@ while True:
         stability.reset()
         tracker.reset_track(tid)
 
-        # ── Slot ENTRY logic [FLOW-1] ─────────────────────────────────────
+        # ── Slot ENTRY logic ──────────────────────────────────────────────
         if not slot.is_occupied:
             slot.park(plate_text, province_str, current_time)
+            update_camera_plate(CAM_ID, plate_text)   # [FIX-4] persist plate
             gate_controller._cmd_cam("/car")
             try:
                 publish_entry_event(rmq_channel, plate_text,
