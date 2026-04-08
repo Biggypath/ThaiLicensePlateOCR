@@ -1,8 +1,8 @@
 """
 rabbitmq/producer.py — Publish OCR events to the backend.
 
-  ocr.entry.events  →  { registration, province, lotId, camId }
-  ocr.exit.events   →  { registration, province, lotId, camId }
+  ocr.entry.events  →  { registration, province, lotId, slotId, camId }
+  ocr.exit.events   →  { registration, province, lotId, slotId, camId }
 """
 
 import json
@@ -22,20 +22,22 @@ def _publish(channel: pika.adapters.blocking_connection.BlockingChannel,
 
 
 def publish_entry_event(channel, registration: str, province: str,
-                        lot_id: str, cam_id: str) -> None:
+                        lot_id: str, slot_id: str, cam_id: str) -> None:
     _publish(channel, "ocr.entry.events", {
         "registration": registration,
         "province": province,
         "lotId": lot_id,
+        "slotId": slot_id,
         "camId": cam_id,
     })
 
 
 def publish_exit_event(channel, registration: str, province: str,
-                       lot_id: str, cam_id: str) -> None:
+                       lot_id: str, slot_id: str, cam_id: str) -> None:
     _publish(channel, "ocr.exit.events", {
         "registration": registration,
         "province": province,
         "lotId": lot_id,
+        "slotId": slot_id,
         "camId": cam_id,
     })

@@ -1,8 +1,8 @@
 [
   {
     "camId": "cam-01",
-    "lotId": "default-lot",
-    "slotId": "A1",
+    "lotId": "053230ff-1e90-4c35-a07d-bc823e94f08e",
+    "slotId": "ecc_B1",
     "streamUrl": "http://172.20.10.7:81/stream",
     "gateUrl": "http://172.20.10.4",
     "camUrl": "http://172.20.10.7",
@@ -11,8 +11,8 @@
   },
   {
     "camId": "cam-02",
-    "lotId": "default-lot",
-    "slotId": "A2",
+    "lotId": "053230ff-1e90-4c35-a07d-bc823e94f08e",
+    "slotId": "ecc_B2",
     "streamUrl": "http://172.20.10.8:81/stream",
     "gateUrl": "http://172.20.10.5",
     "camUrl": "http://172.20.10.8",

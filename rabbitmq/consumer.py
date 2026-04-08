@@ -3,6 +3,15 @@ rabbitmq/consumer.py — Consume ACK messages from the backend in a daemon threa
 
   ocr.entry.ack  →  { camId, lotId, registration, province, status, slotId?, reason?, timestamp }
   ocr.exit.ack   →  { camId, lotId, registration, province, status, totalFee?, durationMinutes?, timestamp }
+
+v2 changes:
+  - Removed gate_controller.notify_entry_ack / notify_exit_ack calls.
+    The backend now controls the gate board DIRECTLY via MQTT
+    (barrier/commands/<camId>). Python no longer needs to call HTTP
+    /open or /close on the gate board.
+  - consumer.py only pushes ACKs into AckStore for main.py to read.
+    main.py uses ACKs to update SlotState and call /open /close on
+    the CAM board servo (which mirrors the gate but is separate).
 """
 
 import json
@@ -13,7 +22,6 @@ from typing import Optional
 import pika
 
 from .connection import connect
-from gate_controller import notify_entry_ack, notify_exit_ack
 
 
 class AckStore:
@@ -21,7 +29,7 @@ class AckStore:
 
     def __init__(self, maxlen: int = 256):
         self._entry_acks: deque[dict] = deque(maxlen=maxlen)
-        self._exit_acks: deque[dict] = deque(maxlen=maxlen)
+        self._exit_acks:  deque[dict] = deque(maxlen=maxlen)
         self._lock = threading.Lock()
 
     # ── writers (called from consumer thread) ──────────────────────────
@@ -45,17 +53,17 @@ class AckStore:
 
 def _on_entry_ack(ch, method, _properties, body, store: AckStore):
     try:
-        ack = json.loads(body)
-        store.push_entry_ack(ack)
+        ack    = json.loads(body)
         status = ack.get("status", "?")
-        reg = ack.get("registration", "?")
+        reg    = ack.get("registration", "?")
         if status == "ALLOWED":
             slot = ack.get("slotId", "?")
             print(f"[ACK-ENTRY] {reg}  → ALLOWED  slot={slot}")
         else:
             reason = ack.get("reason", "")
             print(f"[ACK-ENTRY] {reg}  → {status}  reason={reason}")
-        notify_entry_ack(ack)
+        # Push to store — main.py drains this and calls _cmd_cam(/open) if needed
+        store.push_entry_ack(ack)
     except Exception as exc:
         print(f"[ACK-ENTRY] parse error: {exc}")
     ch.basic_ack(delivery_tag=method.delivery_tag)
@@ -63,14 +71,13 @@ def _on_entry_ack(ch, method, _properties, body, store: AckStore):
 
 def _on_exit_ack(ch, method, _properties, body, store: AckStore):
     try:
-        ack = json.loads(body)
-        store.push_exit_ack(ack)
+        ack    = json.loads(body)
         status = ack.get("status", "?")
-        reg = ack.get("registration", "?")
-        fee = ack.get("totalFee", "?")
-        mins = ack.get("durationMinutes", "?")
+        reg    = ack.get("registration", "?")
+        fee    = ack.get("totalFee", "?")
+        mins   = ack.get("durationMinutes", "?")
         print(f"[ACK-EXIT]  {reg}  → {status}  fee={fee}  duration={mins}min")
-        notify_exit_ack(ack)
+        store.push_exit_ack(ack)
     except Exception as exc:
         print(f"[ACK-EXIT]  parse error: {exc}")
     ch.basic_ack(delivery_tag=method.delivery_tag)
@@ -79,6 +86,7 @@ def _on_exit_ack(ch, method, _properties, body, store: AckStore):
 def _consumer_loop(store: AckStore):
     """Blocking loop that runs in a daemon thread — auto-reconnects."""
     while True:
+        conn = None
         try:
             conn, ch = connect()
             ch.basic_qos(prefetch_count=1)
@@ -94,15 +102,18 @@ def _consumer_loop(store: AckStore):
 
             print("[RMQ-Consumer] Listening on ocr.entry.ack & ocr.exit.ack ...")
             ch.start_consuming()
+
         except pika.exceptions.AMQPConnectionError as exc:
             print(f"[RMQ-Consumer] connection lost: {exc} — reconnecting in 5s")
         except Exception as exc:
             print(f"[RMQ-Consumer] unexpected error: {exc} — reconnecting in 5s")
         finally:
             try:
-                conn.close()
+                if conn:
+                    conn.close()
             except Exception:
                 pass
+
         import time
         time.sleep(5)
 
